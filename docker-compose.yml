@@ -1,0 +1,9 @@
+services:
+  pahmabot:
+    build: .
+    container_name: pahmabot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
