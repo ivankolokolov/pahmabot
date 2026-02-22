@@ -23,11 +23,12 @@ from config import (
     DATA_DIR,
     GREETING_MESSAGES,
     HISTORY_FILE,
+    HOLIDAY_GREETINGS,
     OPTION_VALUES,
     POLL_HOUR,
     POLL_OPTIONS,
+    RU_HOLIDAYS,
     SEASONAL_MESSAGES,
-    WEEKDAY,
 )
 
 logging.basicConfig(
@@ -63,16 +64,93 @@ def save_history(data: dict):
 
 
 # ---------------------------------------------------------------------------
+# Производственный календарь: рабочие дни
+# ---------------------------------------------------------------------------
+
+def is_working_day(d) -> bool:
+    """Является ли день рабочим (не выходной и не праздник)."""
+    if d.weekday() >= 5:
+        return False
+    return d.isoformat() not in RU_HOLIDAYS
+
+
+def get_first_working_day_of_week(d) -> datetime | None:
+    """Первый рабочий день ISO-недели, содержащей дату d. None если вся неделя выходная."""
+    monday = d - timedelta(days=d.weekday())
+    for i in range(5):
+        candidate = monday + timedelta(days=i)
+        if is_working_day(candidate):
+            return candidate
+    return None
+
+
+def get_week_holidays(d) -> list[str]:
+    """Праздники, из-за которых первый рабочий день сдвинулся с понедельника.
+
+    Также проверяет предыдущую неделю: если она была полностью нерабочей
+    (например, новогодние каникулы), возвращает праздник оттуда.
+    """
+    monday = d - timedelta(days=d.weekday())
+    seen = []
+    for i in range(d.weekday()):
+        day = monday + timedelta(days=i)
+        name = RU_HOLIDAYS.get(day.isoformat())
+        if name and name not in seen:
+            seen.append(name)
+
+    if not seen and d.weekday() == 0:
+        prev_monday = monday - timedelta(days=7)
+        if get_first_working_day_of_week(prev_monday) is None:
+            for i in range(5):
+                day = prev_monday + timedelta(days=i)
+                name = RU_HOLIDAYS.get(day.isoformat())
+                if name and name not in seen:
+                    seen.append(name)
+
+    return seen
+
+
+# ---------------------------------------------------------------------------
 # Выбор приветствия
 # ---------------------------------------------------------------------------
 
-def pick_greeting() -> str:
-    """Выбирает случайное приветствие, с учётом сезона."""
+def pick_greeting(history: dict) -> str:
+    """
+    Выбирает приветствие. Приоритет:
+    1. Праздничное (если понедельник был выходным из-за праздника)
+    2. Сезонное (первый опрос месяца)
+    3. Обычное без повторов
+    """
     now = datetime.now(MSK)
-    pool = list(GREETING_MESSAGES)
+    today = now.date()
+
+    week_holidays = get_week_holidays(today)
+    if week_holidays:
+        holiday_name = week_holidays[-1]
+        greetings = HOLIDAY_GREETINGS.get(holiday_name, [])
+        if greetings:
+            history["last_seasonal_month"] = now.month
+            return random.choice(greetings)
+
     seasonal = SEASONAL_MESSAGES.get(now.month, [])
-    pool.extend(seasonal)
-    return random.choice(pool)
+    last_seasonal_month = history.get("last_seasonal_month")
+    if seasonal and last_seasonal_month != now.month:
+        history["last_seasonal_month"] = now.month
+        return random.choice(seasonal)
+
+    used = set(history.get("used_greeting_indices", []))
+    available = [
+        i for i in range(len(GREETING_MESSAGES)) if i not in used
+    ]
+    if not available:
+        used.clear()
+        available = list(range(len(GREETING_MESSAGES)))
+
+    idx = random.choice(available)
+    used.add(idx)
+    history["used_greeting_indices"] = sorted(used)
+
+    return GREETING_MESSAGES[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -220,9 +298,29 @@ def _get_previous_result(history: dict) -> dict | None:
 # Бот: отправка опроса
 # ---------------------------------------------------------------------------
 
+async def maybe_send_poll(bot: Bot):
+    """Проверяет, первый ли рабочий день недели, и отправляет опрос."""
+    today = datetime.now(MSK).date()
+
+    if not is_working_day(today):
+        return
+
+    first_wd = get_first_working_day_of_week(today)
+    if first_wd != today:
+        logger.debug(
+            "Сегодня %s — не первый рабочий день недели (первый: %s), пропускаем.",
+            today, first_wd,
+        )
+        return
+
+    logger.info("Сегодня %s — первый рабочий день недели, запускаем опрос.", today)
+    await send_poll(bot)
+
+
 async def send_poll(bot: Bot):
     """Отправляет опрос в канал."""
-    greeting = pick_greeting()
+    history = load_history()
+    greeting = pick_greeting(history)
     logger.info("Отправляю опрос: %s", greeting)
 
     try:
@@ -234,7 +332,6 @@ async def send_poll(bot: Bot):
             allows_multiple_answers=False,
         )
 
-        history = load_history()
         history["current_poll"] = {
             "message_id": message.message_id,
             "chat_id": message.chat.id,
@@ -252,6 +349,14 @@ async def send_poll(bot: Bot):
 # ---------------------------------------------------------------------------
 # Бот: закрытие опроса и итоги
 # ---------------------------------------------------------------------------
+
+async def maybe_close_poll(bot: Bot):
+    """Закрывает активный опрос, если он есть."""
+    history = load_history()
+    if not history.get("current_poll"):
+        return
+    await close_poll(bot)
+
 
 async def close_poll(bot: Bot):
     """Останавливает опрос, собирает результаты и отправляет итоги."""
@@ -305,23 +410,23 @@ async def close_poll(bot: Bot):
 def create_scheduler(bot: Bot) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=MSK)
 
-    # Каждый понедельник в 9:00 MSK
+    # Каждый будний день в POLL_HOUR — проверка, первый ли рабочий день недели
     scheduler.add_job(
-        send_poll,
-        CronTrigger(day_of_week="mon", hour=POLL_HOUR, minute=0, timezone=MSK),
+        maybe_send_poll,
+        CronTrigger(day_of_week="mon-fri", hour=POLL_HOUR, minute=0, timezone=MSK),
         args=[bot],
-        id="send_poll",
-        name="Отправить опрос",
+        id="maybe_send_poll",
+        name="Проверить и отправить опрос",
         misfire_grace_time=3600,
     )
 
-    # Каждый понедельник в 18:00 MSK
+    # Каждый будний день в CLOSE_HOUR — закрытие, если есть активный опрос
     scheduler.add_job(
-        close_poll,
-        CronTrigger(day_of_week="mon", hour=CLOSE_HOUR, minute=0, timezone=MSK),
+        maybe_close_poll,
+        CronTrigger(day_of_week="mon-fri", hour=CLOSE_HOUR, minute=0, timezone=MSK),
         args=[bot],
-        id="close_poll",
-        name="Закрыть опрос",
+        id="maybe_close_poll",
+        name="Проверить и закрыть опрос",
         misfire_grace_time=3600,
     )
 
@@ -349,8 +454,8 @@ async def main():
     scheduler.start()
 
     logger.info(
-        "Расписание: опрос каждый понедельник в %02d:00 MSK, "
-        "закрытие в %02d:00 MSK",
+        "Расписание: опрос в первый рабочий день недели в %02d:00 MSK, "
+        "закрытие в %02d:00 MSK (производственный календарь РФ)",
         POLL_HOUR,
         CLOSE_HOUR,
     )
