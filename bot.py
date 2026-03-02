@@ -17,6 +17,7 @@ from apscheduler.triggers.cron import CronTrigger
 import pytz
 
 from config import (
+    AVG_COMMENTS,
     BOT_TOKEN,
     CHANNEL_ID,
     CLOSE_HOUR,
@@ -27,8 +28,11 @@ from config import (
     OPTION_VALUES,
     POLL_HOUR,
     POLL_OPTIONS,
+    POLL_TAGLINES,
     RU_HOLIDAYS,
     SEASONAL_MESSAGES,
+    SUMMARY_HEADERS,
+    ZERO_OPTIONS,
 )
 
 logging.basicConfig(
@@ -200,9 +204,8 @@ def format_summary(results: dict, history: dict) -> str:
 
     lines = []
 
-    # Основной блок
-    lines.append(f"📊 Пахма-итоги дня")
-    lines.append(f"")
+    lines.append(random.choice(SUMMARY_HEADERS))
+    lines.append("")
     lines.append(f"Среднее по чату: {avg}/10")
     lines.append(f"Проголосовали: {_voters_word(total)}.")
 
@@ -250,18 +253,19 @@ def format_summary(results: dict, history: dict) -> str:
 
 def _avg_comment(avg: float) -> str | None:
     if avg <= 1:
-        return "Трезвенники. Скучно с вами."
+        key = "sober"
     elif avg <= 2.5:
-        return "Лёгкий понедельник. Так держать."
+        key = "light"
     elif avg <= 4:
-        return "Нормальная рабочая пахма."
+        key = "normal"
     elif avg <= 6:
-        return "Серьёзная пахма. Сочувствую."
+        key = "serious"
     elif avg <= 8:
-        return "Тяжело. Держитесь там."
-    elif avg > 8:
-        return "Катастрофа. Выживайте."
-    return None
+        key = "heavy"
+    else:
+        key = "critical"
+    comments = AVG_COMMENTS.get(key, [])
+    return random.choice(comments) if comments else None
 
 
 def _voters_word(n: int) -> str:
@@ -317,17 +321,27 @@ async def maybe_send_poll(bot: Bot):
     await send_poll(bot)
 
 
+def _build_poll_options() -> list[str]:
+    """Собирает варианты ответа, подставляя случайный текст для 0/10."""
+    options = list(POLL_OPTIONS)
+    options[1] = random.choice(ZERO_OPTIONS)
+    return options
+
+
 async def send_poll(bot: Bot):
     """Отправляет опрос в канал."""
     history = load_history()
     greeting = pick_greeting(history)
-    logger.info("Отправляю опрос: %s", greeting)
+    tagline = random.choice(POLL_TAGLINES)
+    question = f"{greeting}\n{tagline}"
+    options = _build_poll_options()
+    logger.info("Отправляю опрос: %s", question)
 
     try:
         message = await bot.send_poll(
             chat_id=CHANNEL_ID,
-            question=greeting,
-            options=POLL_OPTIONS,
+            question=question,
+            options=options,
             is_anonymous=False,
             allows_multiple_answers=False,
         )
@@ -437,6 +451,30 @@ def create_scheduler(bot: Bot) -> AsyncIOScheduler:
 # Точка входа
 # ---------------------------------------------------------------------------
 
+async def recover_after_restart(bot: Bot):
+    """Обрабатывает пропущенные действия после перезапуска бота."""
+    now = datetime.now(MSK)
+    today = now.date()
+    hour = now.hour
+    history = load_history()
+    current = history.get("current_poll")
+
+    if current:
+        if hour >= CLOSE_HOUR:
+            logger.info("Найден незакрытый опрос после перезапуска, закрываю.")
+            await close_poll(bot)
+        else:
+            logger.info(
+                "Найден активный опрос (message_id=%s), закрытие в %02d:00.",
+                current["message_id"], CLOSE_HOUR,
+            )
+    elif hour >= POLL_HOUR and hour < CLOSE_HOUR:
+        first_wd = get_first_working_day_of_week(today)
+        if first_wd == today and is_working_day(today):
+            logger.info("Пропущен опрос после перезапуска, отправляю.")
+            await send_poll(bot)
+
+
 async def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не задан. Создайте .env файл.")
@@ -449,6 +487,8 @@ async def main():
 
     me = await bot.get_me()
     logger.info("Бот запущен: @%s (%s)", me.username, me.first_name)
+
+    await recover_after_restart(bot)
 
     scheduler = create_scheduler(bot)
     scheduler.start()
