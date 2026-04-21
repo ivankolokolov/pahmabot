@@ -25,10 +25,14 @@ from config import (
     GREETING_MESSAGES,
     HISTORY_FILE,
     HOLIDAY_GREETINGS,
+    IDX_PHANTOM,
+    IDX_SOBER,
+    IDX_STILL_DRUNK,
     OPTION_VALUES,
     POLL_HOUR,
     POLL_OPTIONS,
     POLL_TAGLINES,
+    REVEAL_PHRASES,
     RU_HOLIDAYS,
     SEASONAL_MESSAGES,
     SUMMARY_HEADERS,
@@ -56,15 +60,23 @@ def load_history() -> dict:
     """Загружает историю опросов из JSON-файла."""
     ensure_data_dir()
     if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error("Повреждён history.json, создаю резервную копию: %s", e)
+            backup = HISTORY_FILE + ".bak"
+            if os.path.exists(HISTORY_FILE):
+                os.replace(HISTORY_FILE, backup)
     return {"polls": [], "current_poll": None}
 
 
 def save_history(data: dict):
     ensure_data_dir()
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+    tmp_path = HISTORY_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, HISTORY_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -162,28 +174,31 @@ def pick_greeting(history: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def compute_results(voter_counts: list[int]) -> dict:
-    """
-    Подсчитывает статистику:
-    - average: среднее значение пахмы
-    - total_voters: сколько проголосовало
-    - phantom_count: сколько выбрали «фантомную пахму»
-    - still_drunk: сколько ещё пьют
-    """
     total_voters = sum(voter_counts)
-    phantom_count = voter_counts[10] if len(voter_counts) > 10 else 0
-    still_drunk = voter_counts[0] if voter_counts else 0
+    sober_count = voter_counts[IDX_SOBER] if len(voter_counts) > IDX_SOBER else 0
+    still_drunk = voter_counts[IDX_STILL_DRUNK] if len(voter_counts) > IDX_STILL_DRUNK else 0
+    phantom_count = voter_counts[IDX_PHANTOM] if len(voter_counts) > IDX_PHANTOM else 0
 
     weighted_sum = 0.0
     numeric_voters = 0
+    hangover_sum = 0.0
+    hangover_count = 0
     for idx, count in enumerate(voter_counts):
         if idx in OPTION_VALUES and count > 0:
             weighted_sum += OPTION_VALUES[idx] * count
             numeric_voters += count
+            if OPTION_VALUES[idx] > 0 and idx != IDX_STILL_DRUNK:
+                hangover_sum += OPTION_VALUES[idx] * count
+                hangover_count += count
 
     average = round(weighted_sum / numeric_voters, 1) if numeric_voters > 0 else 0.0
+    hangover_avg = round(hangover_sum / hangover_count, 1) if hangover_count > 0 else 0.0
 
     return {
         "average": average,
+        "hangover_avg": hangover_avg,
+        "hangover_count": hangover_count,
+        "sober_count": sober_count,
         "total_voters": total_voters,
         "phantom_count": phantom_count,
         "still_drunk": still_drunk,
@@ -201,54 +216,125 @@ def format_summary(results: dict, history: dict) -> str:
     total = results["total_voters"]
     phantom = results["phantom_count"]
     drunk = results["still_drunk"]
+    sober = results["sober_count"]
+    hangover_count = results["hangover_count"]
+    hangover_avg = results["hangover_avg"]
+    custom_options = results.get("custom_options", [])
+    polls = history.get("polls", [])
+    poll_number = len(polls) + 1
 
     lines = []
 
-    lines.append(random.choice(SUMMARY_HEADERS))
+    lines.append(random.choice(REVEAL_PHRASES))
     lines.append("")
-    lines.append(f"Среднее по чату: {avg}/10")
+    lines.append(f"{random.choice(SUMMARY_HEADERS)} (#{poll_number})")
+    lines.append("")
     lines.append(f"Проголосовали: {_voters_word(total)}.")
+
+    if total > 0:
+        sober_pct = round(sober / total * 100)
+        with_pahma = hangover_count + drunk
+        if with_pahma > 0:
+            lines.append(f"Трезвых: {sober} ({sober_pct}%), с пахмой: {with_pahma}.")
+        else:
+            lines.append(f"Трезвых: {sober} ({sober_pct}%).")
+
+    lines.append("")
+    lines.append(f"Средняя пахма по чату: {avg}/10")
+    if hangover_count > 0:
+        lines.append(f"Средняя среди похмельных: {hangover_avg}/10")
 
     if drunk > 0:
         lines.append(f"Ещё пьют: {drunk} чел. 🍻")
 
     if phantom > 0:
-        word = _phantom_word(phantom)
+        word = _people_word(phantom)
         lines.append(f"Фантомная пахма: {phantom} {word} 👻")
 
     # Сравнение с прошлой неделей
     prev = _get_previous_result(history)
     if prev is not None:
-        diff = round(avg - prev["average"], 1)
-        if abs(diff) >= 1.0:
+        prev_avg = prev["average"]
+        diff = round(avg - prev_avg, 1)
+        if abs(diff) >= 0.5:
+            lines.append("")
             if diff > 0:
-                lines.append("")
                 if avg >= 7:
-                    lines.append(f"⚠️ Тяжёлый понедельник! +{diff} к прошлой неделе ({prev['average']}).")
+                    lines.append(f"⚠️ Тяжёлая неделя! +{diff} к прошлой ({prev_avg}).")
                 else:
-                    lines.append(f"📈 Пахма подросла: +{diff} к прошлой неделе ({prev['average']}).")
+                    lines.append(f"📈 Пахма подросла: +{diff} к прошлой неделе ({prev_avg}).")
             else:
-                lines.append("")
-                lines.append(f"📉 Полегчало: {diff} к прошлой неделе ({prev['average']}). Молодцы.")
+                lines.append(f"📉 Полегчало: {diff} к прошлой неделе ({prev_avg}).")
 
-        # Исторический рекорд
-        all_avgs = [p["average"] for p in history.get("polls", []) if "average" in p]
-        if all_avgs and avg >= max(all_avgs) and avg >= 5:
-            lines.append("🏆 Это рекорд пахмы за всё время наблюдений!")
-        elif all_avgs and len(all_avgs) >= 4:
+        prev_hangover = prev.get("hangover_count", prev.get("drinker_count", 0))
+        if hangover_count > 0 and prev_hangover > 0:
+            diff_h = hangover_count - prev_hangover
+            if abs(diff_h) >= 2:
+                if diff_h > 0:
+                    lines.append(f"Похмельных стало больше: {hangover_count} vs {prev_hangover}.")
+                else:
+                    lines.append(f"Похмельных стало меньше: {hangover_count} vs {prev_hangover}.")
+
+    # Рекорды и антирекорды
+    all_avgs = [p["average"] for p in polls if "average" in p]
+    if all_avgs:
+        if avg > 0 and avg >= max(all_avgs):
+            lines.append("🏆 Рекорд пахмы за всё время!")
+        elif avg <= min(all_avgs) and len(all_avgs) >= 3:
+            lines.append("🧊 Антирекорд! Самая трезвая неделя за всю историю.")
+
+        if len(all_avgs) >= 4:
             recent_4 = all_avgs[-4:]
-            if avg == max(recent_4) and avg >= 5:
-                lines.append("Это самый тяжёлый понедельник за последний месяц.")
-            elif avg == min(recent_4) and avg <= 3:
-                lines.append("Самый трезвый понедельник за месяц. Уважаю.")
+            if avg > 0 and avg == max(recent_4):
+                lines.append("Самая тяжёлая неделя за последний месяц.")
+            elif avg == min(recent_4) and avg < max(recent_4):
+                lines.append("Самая лёгкая неделя за месяц.")
 
-    # Шутка по среднему
-    comment = _avg_comment(avg)
+    # Серия трезвости
+    sober_streak = _count_sober_streak(polls, avg)
+    if sober_streak >= 2:
+        lines.append(f"🧘 Серия трезвости: {sober_streak} недель подряд средняя < 1!")
+
+    # Пользовательские варианты
+    voted_custom = [c for c in custom_options if c["votes"] > 0]
+    if voted_custom:
+        lines.append("")
+        lines.append("✏️ Народное творчество:")
+        for c in voted_custom:
+            lines.append(f'  • «{c["text"]}» — {c["votes"]} гол.')
+    elif custom_options:
+        lines.append("")
+        lines.append("✏️ Народное творчество было, но никто не проголосовал.")
+
+    # Комментарий — по средней среди похмельных (если есть), иначе по общей
+    comment_avg = hangover_avg if hangover_count > 0 else avg
+    comment = _avg_comment(comment_avg)
     if comment:
         lines.append("")
         lines.append(comment)
 
+    # Историческая статистика (каждые 10 опросов)
+    if poll_number >= 5 and poll_number % 10 == 0:
+        avgs_with_current = all_avgs + [avg]
+        all_time_avg = round(sum(avgs_with_current) / len(avgs_with_current), 1)
+        lines.append("")
+        lines.append(f"📈 За {poll_number} опросов: средняя {all_time_avg}/10, "
+                     f"макс. {max(avgs_with_current)}, мин. {min(avgs_with_current)}.")
+
     return "\n".join(lines)
+
+
+def _count_sober_streak(polls: list[dict], current_avg: float) -> int:
+    """Считает текущую серию недель со средней < 1 (включая текущую)."""
+    if current_avg >= 1:
+        return 0
+    streak = 1
+    for p in reversed(polls):
+        if p.get("average", 10) < 1:
+            streak += 1
+        else:
+            break
+    return streak
 
 
 def _avg_comment(avg: float) -> str | None:
@@ -269,24 +355,15 @@ def _avg_comment(avg: float) -> str | None:
 
 
 def _voters_word(n: int) -> str:
-    """Склонение «человек»."""
-    if 11 <= n % 100 <= 19:
-        return f"{n} человек"
-    last = n % 10
-    if last == 1:
-        return f"{n} человек"
-    elif 2 <= last <= 4:
-        return f"{n} человека"
-    return f"{n} человек"
+    return f"{n} {_people_word(n)}"
 
 
-def _phantom_word(n: int) -> str:
+def _people_word(n: int) -> str:
+    """Склонение слова «человек»."""
     if 11 <= n % 100 <= 19:
         return "человек"
     last = n % 10
-    if last == 1:
-        return "человек"
-    elif 2 <= last <= 4:
+    if 2 <= last <= 4:
         return "человека"
     return "человек"
 
@@ -309,6 +386,11 @@ async def maybe_send_poll(bot: Bot):
     if not is_working_day(today):
         return
 
+    history = load_history()
+    if history.get("current_poll"):
+        logger.debug("Опрос уже отправлен сегодня, пропускаем.")
+        return
+
     first_wd = get_first_working_day_of_week(today)
     if first_wd != today:
         logger.debug(
@@ -324,7 +406,7 @@ async def maybe_send_poll(bot: Bot):
 def _build_poll_options() -> list[str]:
     """Собирает варианты ответа, подставляя случайный текст для 0/10."""
     options = list(POLL_OPTIONS)
-    options[1] = random.choice(ZERO_OPTIONS)
+    options[IDX_SOBER] = random.choice(ZERO_OPTIONS)
     return options
 
 
@@ -332,18 +414,34 @@ async def send_poll(bot: Bot):
     """Отправляет опрос в канал."""
     history = load_history()
     greeting = pick_greeting(history)
-    tagline = random.choice(POLL_TAGLINES)
-    question = f"{greeting}\n{tagline}"
     options = _build_poll_options()
-    logger.info("Отправляю опрос: %s", question)
+
+    tagline = random.choice(POLL_TAGLINES)
+    description = (
+        f"{tagline}\n\n"
+        "🔒 Результаты скрыты до закрытия опроса\n"
+        "✏️ Можешь добавить свой вариант ответа"
+    )
+
+    now = datetime.now(MSK)
+    close_time = now.replace(hour=23, minute=59, second=0, microsecond=0)
+    close_timestamp = int(close_time.timestamp())
+
+    logger.info("Отправляю опрос: %s", greeting)
 
     try:
         message = await bot.send_poll(
             chat_id=CHANNEL_ID,
-            question=question,
+            question=greeting,
             options=options,
             is_anonymous=False,
             allows_multiple_answers=False,
+            close_date=close_timestamp,
+            api_kwargs={
+                "description": description,
+                "hide_results_until_closes": True,
+                "allow_adding_options": True,
+            },
         )
 
         history["current_poll"] = {
@@ -372,6 +470,25 @@ async def maybe_close_poll(bot: Bot):
     await close_poll(bot)
 
 
+async def _get_poll_from_message(bot: Bot, current: dict) -> Poll | None:
+    """Пытается получить Poll из уже закрытого опроса через пересылку сообщения."""
+    try:
+        fwd = await bot.forward_message(
+            chat_id=current["chat_id"],
+            from_chat_id=current["chat_id"],
+            message_id=current["message_id"],
+        )
+        poll = fwd.poll
+        try:
+            await bot.delete_message(chat_id=current["chat_id"], message_id=fwd.message_id)
+        except TelegramError:
+            pass
+        return poll
+    except TelegramError as e:
+        logger.error("Не удалось переслать сообщение опроса: %s", e)
+        return None
+
+
 async def close_poll(bot: Bot):
     """Останавливает опрос, собирает результаты и отправляет итоги."""
     history = load_history()
@@ -386,19 +503,47 @@ async def close_poll(bot: Bot):
             chat_id=current["chat_id"],
             message_id=current["message_id"],
         )
+    except TelegramError as e:
+        if "poll has already been closed" in str(e).lower():
+            logger.info("Опрос уже закрыт автоматически (close_date), пробуем получить результаты.")
+            poll = await _get_poll_from_message(bot, current)
+            if poll is None:
+                logger.warning("Не удалось получить результаты закрытого опроса.")
+                history["current_poll"] = None
+                save_history(history)
+                return
+        else:
+            logger.error("Ошибка закрытия опроса: %s", e)
+            return
 
+    try:
         voter_counts = [opt.voter_count for opt in poll.options]
-        results = compute_results(voter_counts)
+        num_standard = len(POLL_OPTIONS)
+        custom_options = []
+        for i, opt in enumerate(poll.options):
+            if i >= num_standard:
+                custom_options.append({
+                    "text": opt.text,
+                    "votes": opt.voter_count,
+                })
 
-        # Сохраняем в историю
+        results = compute_results(voter_counts)
+        results["custom_options"] = custom_options
+
+        poll_number = len(history.get("polls", [])) + 1
         record = {
+            "poll_number": poll_number,
             "date": current["date"],
             "greeting": current["greeting"],
             "average": results["average"],
+            "hangover_avg": results["hangover_avg"],
+            "hangover_count": results["hangover_count"],
+            "sober_count": results["sober_count"],
             "total_voters": results["total_voters"],
             "phantom_count": results["phantom_count"],
             "still_drunk": results["still_drunk"],
-            "voter_counts": voter_counts,
+            "voter_counts": voter_counts[:num_standard],
+            "custom_options": custom_options,
         }
 
         summary = format_summary(results, history)
@@ -413,8 +558,8 @@ async def close_poll(bot: Bot):
         )
         logger.info("Опрос закрыт, среднее: %s", results["average"])
 
-    except TelegramError as e:
-        logger.error("Ошибка закрытия опроса: %s", e)
+    except Exception as e:
+        logger.error("Ошибка обработки результатов: %s", e)
 
 
 # ---------------------------------------------------------------------------
