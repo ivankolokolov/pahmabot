@@ -412,8 +412,8 @@ def _build_poll_options() -> list[str]:
     return options
 
 
-def _is_retryable_send_poll_error(err: TelegramError) -> bool:
-    """Определяет, стоит ли повторять отправку опроса."""
+def _is_retryable_api_error(err: TelegramError) -> bool:
+    """Временные сбои API/сети — имеет смысл повторить запрос."""
     if isinstance(err, (TimedOut, NetworkError)):
         return True
     text = str(err).lower()
@@ -485,7 +485,7 @@ async def send_poll(bot: Bot):
             )
             await asyncio.sleep(delay)
         except TelegramError as e:
-            if attempt >= SEND_POLL_MAX_ATTEMPTS or not _is_retryable_send_poll_error(e):
+            if attempt >= SEND_POLL_MAX_ATTEMPTS or not _is_retryable_api_error(e):
                 logger.error("Ошибка отправки опроса: %s", e)
                 return
             delay = SEND_POLL_RETRY_DELAY_SECONDS * attempt
@@ -513,21 +513,126 @@ async def maybe_close_poll(bot: Bot):
 
 async def _get_poll_from_message(bot: Bot, current: dict) -> Poll | None:
     """Пытается получить Poll из уже закрытого опроса через пересылку сообщения."""
-    try:
-        fwd = await bot.forward_message(
-            chat_id=current["chat_id"],
-            from_chat_id=current["chat_id"],
-            message_id=current["message_id"],
-        )
-        poll = fwd.poll
+    for attempt in range(1, SEND_POLL_MAX_ATTEMPTS + 1):
         try:
-            await bot.delete_message(chat_id=current["chat_id"], message_id=fwd.message_id)
-        except TelegramError:
-            pass
-        return poll
-    except TelegramError as e:
-        logger.error("Не удалось переслать сообщение опроса: %s", e)
-        return None
+            fwd = await bot.forward_message(
+                chat_id=current["chat_id"],
+                from_chat_id=current["chat_id"],
+                message_id=current["message_id"],
+            )
+            poll = fwd.poll
+            try:
+                await bot.delete_message(chat_id=current["chat_id"], message_id=fwd.message_id)
+            except TelegramError:
+                pass
+            return poll
+        except RetryAfter as e:
+            if attempt >= SEND_POLL_MAX_ATTEMPTS:
+                logger.error("forward_message: превышен лимит после %s попыток: %s", attempt, e)
+                return None
+            delay = max(int(getattr(e, "retry_after", 0)), SEND_POLL_RETRY_DELAY_SECONDS)
+            logger.warning(
+                "forward_message: RetryAfter, ждём %s сек (%s/%s).",
+                delay,
+                attempt + 1,
+                SEND_POLL_MAX_ATTEMPTS,
+            )
+            await asyncio.sleep(delay)
+        except TelegramError as e:
+            if attempt >= SEND_POLL_MAX_ATTEMPTS or not _is_retryable_api_error(e):
+                logger.error("Не удалось переслать сообщение опроса: %s", e)
+                return None
+            delay = SEND_POLL_RETRY_DELAY_SECONDS * attempt
+            logger.warning(
+                "forward_message: временная ошибка, повтор через %s сек: %s",
+                delay,
+                e,
+            )
+            await asyncio.sleep(delay)
+    return None
+
+
+async def _stop_poll_resilient(bot: Bot, current: dict) -> Poll | None:
+    """stop_poll с ретраями; при неудаче — poll через forward (уже закрыт или обход таймаута)."""
+    chat_id = current["chat_id"]
+    message_id = current["message_id"]
+
+    for attempt in range(1, SEND_POLL_MAX_ATTEMPTS + 1):
+        try:
+            return await bot.stop_poll(
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+        except RetryAfter as e:
+            if attempt >= SEND_POLL_MAX_ATTEMPTS:
+                break
+            delay = max(int(getattr(e, "retry_after", 0)), SEND_POLL_RETRY_DELAY_SECONDS)
+            logger.warning(
+                "stop_poll: лимит API, ждём %s сек (попытка %s/%s).",
+                delay,
+                attempt + 1,
+                SEND_POLL_MAX_ATTEMPTS,
+            )
+            await asyncio.sleep(delay)
+        except TelegramError as e:
+            if "poll has already been closed" in str(e).lower():
+                logger.info(
+                    "Опрос уже закрыт автоматически (close_date), пробуем получить результаты.",
+                )
+                poll = await _get_poll_from_message(bot, current)
+                return poll
+            if attempt < SEND_POLL_MAX_ATTEMPTS and _is_retryable_api_error(e):
+                delay = SEND_POLL_RETRY_DELAY_SECONDS * attempt
+                logger.warning(
+                    "stop_poll: временная ошибка (%s). Повтор через %s сек (%s/%s).",
+                    e,
+                    delay,
+                    attempt + 1,
+                    SEND_POLL_MAX_ATTEMPTS,
+                )
+                await asyncio.sleep(delay)
+                continue
+            logger.error("stop_poll: %s", e)
+            poll = await _get_poll_from_message(bot, current)
+            return poll
+
+    logger.warning(
+        "stop_poll: исчерпаны попытки (%s), пробуем получить опрос через forward.",
+        SEND_POLL_MAX_ATTEMPTS,
+    )
+    return await _get_poll_from_message(bot, current)
+
+
+async def _send_summary_resilient(bot: Bot, text: str) -> bool:
+    """Отправка итогов с ретраями (чтобы не потерять из‑за Timed out)."""
+    for attempt in range(1, SEND_POLL_MAX_ATTEMPTS + 1):
+        try:
+            await bot.send_message(chat_id=CHANNEL_ID, text=text)
+            return True
+        except RetryAfter as e:
+            if attempt >= SEND_POLL_MAX_ATTEMPTS:
+                logger.error("send_message (итоги): превышен лимит: %s", e)
+                return False
+            delay = max(int(getattr(e, "retry_after", 0)), SEND_POLL_RETRY_DELAY_SECONDS)
+            logger.warning(
+                "send_message (итоги): RetryAfter, ждём %s сек (%s/%s).",
+                delay,
+                attempt + 1,
+                SEND_POLL_MAX_ATTEMPTS,
+            )
+            await asyncio.sleep(delay)
+        except TelegramError as e:
+            if attempt >= SEND_POLL_MAX_ATTEMPTS or not _is_retryable_api_error(e):
+                logger.error("send_message (итоги): %s", e)
+                return False
+            delay = SEND_POLL_RETRY_DELAY_SECONDS * attempt
+            logger.warning(
+                "send_message (итоги): временная ошибка, повтор через %s сек: %s",
+                delay,
+                e,
+            )
+            await asyncio.sleep(delay)
+    return False
 
 
 async def close_poll(bot: Bot):
@@ -539,23 +644,10 @@ async def close_poll(bot: Bot):
         logger.warning("Нет активного опроса для закрытия.")
         return
 
-    try:
-        poll: Poll = await bot.stop_poll(
-            chat_id=current["chat_id"],
-            message_id=current["message_id"],
-        )
-    except TelegramError as e:
-        if "poll has already been closed" in str(e).lower():
-            logger.info("Опрос уже закрыт автоматически (close_date), пробуем получить результаты.")
-            poll = await _get_poll_from_message(bot, current)
-            if poll is None:
-                logger.warning("Не удалось получить результаты закрытого опроса.")
-                history["current_poll"] = None
-                save_history(history)
-                return
-        else:
-            logger.error("Ошибка закрытия опроса: %s", e)
-            return
+    poll = await _stop_poll_resilient(bot, current)
+    if poll is None:
+        logger.error("Не удалось закрыть опрос и получить данные для итогов.")
+        return
 
     try:
         voter_counts = [opt.voter_count for opt in poll.options]
@@ -589,14 +681,16 @@ async def close_poll(bot: Bot):
 
         summary = format_summary(results, history)
 
+        if not await _send_summary_resilient(bot, summary):
+            logger.error(
+                "Итоги в чат не доставлены после ретраев; "
+                "current_poll оставлен — повтор при следующем запуске закрытия.",
+            )
+            return
+
         history["polls"].append(record)
         history["current_poll"] = None
         save_history(history)
-
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=summary,
-        )
         logger.info("Опрос закрыт, среднее: %s", results["average"])
 
     except Exception as e:
