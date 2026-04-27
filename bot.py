@@ -11,7 +11,7 @@ import random
 from datetime import datetime, timedelta
 
 from telegram import Bot, Poll
-from telegram.error import TelegramError
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
@@ -34,6 +34,8 @@ from config import (
     POLL_TAGLINES,
     REVEAL_PHRASES,
     RU_HOLIDAYS,
+    SEND_POLL_MAX_ATTEMPTS,
+    SEND_POLL_RETRY_DELAY_SECONDS,
     SEASONAL_MESSAGES,
     SUMMARY_HEADERS,
     ZERO_OPTIONS,
@@ -410,6 +412,22 @@ def _build_poll_options() -> list[str]:
     return options
 
 
+def _is_retryable_send_poll_error(err: TelegramError) -> bool:
+    """Определяет, стоит ли повторять отправку опроса."""
+    if isinstance(err, (TimedOut, NetworkError)):
+        return True
+    text = str(err).lower()
+    retry_markers = (
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "internal server error",
+    )
+    return any(marker in text for marker in retry_markers)
+
+
 async def send_poll(bot: Bot):
     """Отправляет опрос в канал."""
     history = load_history()
@@ -428,34 +446,57 @@ async def send_poll(bot: Bot):
     close_timestamp = int(close_time.timestamp())
 
     logger.info("Отправляю опрос: %s", greeting)
+    for attempt in range(1, SEND_POLL_MAX_ATTEMPTS + 1):
+        try:
+            message = await bot.send_poll(
+                chat_id=CHANNEL_ID,
+                question=greeting,
+                options=options,
+                is_anonymous=False,
+                allows_multiple_answers=False,
+                close_date=close_timestamp,
+                api_kwargs={
+                    "description": description,
+                    "hide_results_until_closes": True,
+                    "allow_adding_options": True,
+                },
+            )
 
-    try:
-        message = await bot.send_poll(
-            chat_id=CHANNEL_ID,
-            question=greeting,
-            options=options,
-            is_anonymous=False,
-            allows_multiple_answers=False,
-            close_date=close_timestamp,
-            api_kwargs={
-                "description": description,
-                "hide_results_until_closes": True,
-                "allow_adding_options": True,
-            },
-        )
-
-        history["current_poll"] = {
-            "message_id": message.message_id,
-            "chat_id": message.chat.id,
-            "poll_id": message.poll.id,
-            "date": datetime.now(MSK).isoformat(),
-            "greeting": greeting,
-        }
-        save_history(history)
-        logger.info("Опрос отправлен, message_id=%s", message.message_id)
-
-    except TelegramError as e:
-        logger.error("Ошибка отправки опроса: %s", e)
+            history["current_poll"] = {
+                "message_id": message.message_id,
+                "chat_id": message.chat.id,
+                "poll_id": message.poll.id,
+                "date": datetime.now(MSK).isoformat(),
+                "greeting": greeting,
+            }
+            save_history(history)
+            logger.info("Опрос отправлен, message_id=%s", message.message_id)
+            return
+        except RetryAfter as e:
+            if attempt >= SEND_POLL_MAX_ATTEMPTS:
+                logger.error("Ошибка отправки опроса после %s попыток: %s", attempt, e)
+                return
+            delay = max(int(getattr(e, "retry_after", 0)), SEND_POLL_RETRY_DELAY_SECONDS)
+            logger.warning(
+                "Ограничение Telegram API. Повтор отправки через %s сек (попытка %s/%s).",
+                delay,
+                attempt + 1,
+                SEND_POLL_MAX_ATTEMPTS,
+            )
+            await asyncio.sleep(delay)
+        except TelegramError as e:
+            if attempt >= SEND_POLL_MAX_ATTEMPTS or not _is_retryable_send_poll_error(e):
+                logger.error("Ошибка отправки опроса: %s", e)
+                return
+            delay = SEND_POLL_RETRY_DELAY_SECONDS * attempt
+            logger.warning(
+                "Временная ошибка отправки (%s). Повтор через %s сек (попытка %s/%s).",
+                e,
+                delay,
+                attempt + 1,
+                SEND_POLL_MAX_ATTEMPTS,
+            )
+            await asyncio.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
