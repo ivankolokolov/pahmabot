@@ -6,6 +6,11 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "")  # @channel_name или числовой ID
 
+# Прокси для доступа к Telegram API (если хостинг блокирует Telegram).
+# Поддерживается http(s):// и socks5:// (например socks5://user:pass@1.2.3.4:1080).
+# Пусто — ходим в Telegram напрямую.
+TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "")
+
 # Время по Москве (UTC+3)
 POLL_HOUR = 9    # Опрос в 9:00
 CLOSE_HOUR = 18  # Закрытие в 18:00

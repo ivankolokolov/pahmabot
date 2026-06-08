@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 
 from telegram import Bot, Poll
 from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.request import HTTPXRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
@@ -38,6 +39,7 @@ from config import (
     SEND_POLL_RETRY_DELAY_SECONDS,
     SEASONAL_MESSAGES,
     SUMMARY_HEADERS,
+    TELEGRAM_PROXY,
     ZERO_OPTIONS,
 )
 
@@ -437,7 +439,6 @@ async def send_poll(bot: Bot):
     tagline = random.choice(POLL_TAGLINES)
     description = (
         f"{tagline}\n\n"
-        "🔒 Результаты скрыты до закрытия опроса\n"
         "✏️ Можешь добавить свой вариант ответа"
     )
 
@@ -457,7 +458,6 @@ async def send_poll(bot: Bot):
                 close_date=close_timestamp,
                 api_kwargs={
                     "description": description,
-                    "hide_results_until_closes": True,
                     "allow_adding_options": True,
                 },
             )
@@ -763,7 +763,15 @@ async def main():
         logger.error("CHANNEL_ID не задан. Создайте .env файл.")
         return
 
-    bot = Bot(token=BOT_TOKEN)
+    if TELEGRAM_PROXY:
+        logger.info("Использую прокси для Telegram API.")
+        bot = Bot(
+            token=BOT_TOKEN,
+            request=HTTPXRequest(proxy=TELEGRAM_PROXY),
+            get_updates_request=HTTPXRequest(proxy=TELEGRAM_PROXY),
+        )
+    else:
+        bot = Bot(token=BOT_TOKEN)
 
     me = await bot.get_me()
     logger.info("Бот запущен: @%s (%s)", me.username, me.first_name)
