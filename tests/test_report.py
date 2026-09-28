@@ -56,14 +56,26 @@ def test_cold_start_has_no_comparisons():
     assert not any(line in text for options in VERDICT_TEXTS.values() for line in options)
 
 
-def test_old_scale_does_not_block_records():
-    old = [{"poll_number": i + 1, "date": "2026-03-02T09:00:00+03:00", "average": a}
-           for i, a in enumerate([0.4, 1.8, 0.4])]
-    polls = old + [rec(4 + i, avg=a) for i, a in enumerate([1.0, 1.2, 0.9, 1.1])]
-    history = {"polls": polls}
+def old_layout(avg, counts):
+    """Запись февраля–апреля: «Ещё пью» первым вариантом, без разбивки по трезвым."""
+    return {"date": "2026-03-16T09:00:00+03:00", "greeting": "g", "average": avg,
+            "total_voters": sum(counts), "still_drunk": counts[0], "phantom_count": counts[10],
+            "voter_counts": counts}
+
+
+def test_old_layout_is_converted():
+    p = report._from_old_layout(old_layout(1.8, [3, 19, 3, 3, 2, 2, 1, 0, 0, 0, 1]))
+    assert p["voter_counts"] == [19, 3, 3, 2, 2, 1, 0, 0, 0, 3, 1]
+    assert (p["average"], p["sober_count"], p["still_drunk"], p["phantom_count"]) == (1.8, 19, 3, 1)
+
+
+def test_old_layout_polls_count_for_records():
+    polls = [old_layout(1.8, [3, 19, 3, 3, 2, 2, 1, 0, 0, 0, 1])] + weeks([1.0, 1.2, 0.9, 1.1])
     random.seed(1)
-    text = report.format_summary(rec(8, avg=1.7), history)
-    assert "рекорд" in text.lower() or "самая высокая средняя" in text.lower()
+    assert "рекорд" not in report.format_summary(rec(6, avg=1.7), {"polls": polls}).lower()
+    random.seed(1)
+    text = report.format_summary(rec(6, avg=1.9), {"polls": polls}).lower()
+    assert "рекорд" in text or "самая высокая средняя" in text
 
 
 def tier_of(text):

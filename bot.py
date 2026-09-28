@@ -31,10 +31,7 @@ from config import (
     GREETING_MESSAGES,
     HISTORY_FILE,
     HOLIDAY_GREETINGS,
-    IDX_PHANTOM,
     IDX_SOBER,
-    IDX_STILL_DRUNK,
-    OPTION_VALUES,
     POLL_HOUR,
     POLL_OPTIONS,
     POLL_TAGLINES,
@@ -43,7 +40,7 @@ from config import (
     TELEGRAM_PROXY,
     ZERO_OPTIONS,
 )
-from report import format_summary
+from report import compute_results, format_summary
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -168,37 +165,6 @@ def pick_greeting(history: dict) -> str:
     history["used_greeting_indices"] = sorted(used)
 
     return GREETING_MESSAGES[idx]
-
-
-# ---------------------------------------------------------------------------
-# Подсчёт результатов
-# ---------------------------------------------------------------------------
-
-def compute_results(voter_counts: list[int]) -> dict:
-    weighted_sum = 0.0
-    numeric_voters = 0
-    hangover_sum = 0.0
-    hangover_count = 0
-    for idx, count in enumerate(voter_counts):
-        if idx in OPTION_VALUES and count > 0:
-            weighted_sum += OPTION_VALUES[idx] * count
-            numeric_voters += count
-            if OPTION_VALUES[idx] > 0 and idx != IDX_STILL_DRUNK:
-                hangover_sum += OPTION_VALUES[idx] * count
-                hangover_count += count
-
-    average = round(weighted_sum / numeric_voters, 1) if numeric_voters > 0 else 0.0
-    hangover_avg = round(hangover_sum / hangover_count, 1) if hangover_count > 0 else 0.0
-
-    return {
-        "average": average,
-        "hangover_avg": hangover_avg,
-        "hangover_count": hangover_count,
-        "sober_count": voter_counts[IDX_SOBER],
-        "total_voters": sum(voter_counts),
-        "phantom_count": voter_counts[IDX_PHANTOM],
-        "still_drunk": voter_counts[IDX_STILL_DRUNK],
-    }
 
 
 # ---------------------------------------------------------------------------

@@ -36,13 +36,41 @@ MONTHS_PREP = ["", "январе", "феврале", "марте", "апреле
                "августе", "сентябре", "октябре", "ноябре", "декабре"]
 
 
+def compute_results(voter_counts: list[int]) -> dict:
+    """Сводные цифры опроса по числу голосов за каждый вариант (текущий порядок вариантов)."""
+    weighted_sum = 0.0
+    numeric_voters = 0
+    hangover_sum = 0.0
+    hangover_count = 0
+    for idx, count in enumerate(voter_counts):
+        if idx in OPTION_VALUES and count > 0:
+            weighted_sum += OPTION_VALUES[idx] * count
+            numeric_voters += count
+            if OPTION_VALUES[idx] > 0 and idx != IDX_STILL_DRUNK:
+                hangover_sum += OPTION_VALUES[idx] * count
+                hangover_count += count
+
+    average = round(weighted_sum / numeric_voters, 1) if numeric_voters > 0 else 0.0
+    hangover_avg = round(hangover_sum / hangover_count, 1) if hangover_count > 0 else 0.0
+
+    return {
+        "average": average,
+        "hangover_avg": hangover_avg,
+        "hangover_count": hangover_count,
+        "sober_count": voter_counts[IDX_SOBER],
+        "total_voters": sum(voter_counts),
+        "phantom_count": voter_counts[IDX_PHANTOM],
+        "still_drunk": voter_counts[IDX_STILL_DRUNK],
+    }
+
+
 def format_summary(record: dict, history: dict, month_end: bool = False) -> str:
     """Формирует текст итогов по записи опроса.
 
     history — состояние до этого опроса; в нём же обновляется ротация фактов и вердиктов.
     month_end — последний опрос месяца: добавить итоги месяца.
     """
-    polls = _scale_polls(history.get("polls", []))
+    polls = _comparable_polls(history.get("polls", []))
 
     lines = [f"{random.choice(SUMMARY_HEADERS)} (#{record['poll_number']})"]
     lines += _base_lines(record)
@@ -349,7 +377,7 @@ def _custom_lines(r: dict) -> list[str]:
 
 def _month_lines(r: dict, history: dict) -> list[str]:
     """Итоги месяца — в последнем опросе месяца."""
-    polls = _scale_polls(history.get("polls", [])) + [r]
+    polls = _comparable_polls(history.get("polls", [])) + [r]
     month = _month(r)
     in_month = [p for p in polls if _month(p) == month]
     if len(in_month) < 2:
@@ -406,11 +434,11 @@ def _month_lines(r: dict, history: dict) -> list[str]:
 
 
 def _jubilee_lines(r: dict, history: dict) -> list[str]:
-    """Историческая статистика — каждые 10 опросов (по текущей шкале, как и рекорды)."""
+    """Историческая статистика — каждые 10 опросов."""
     n = r["poll_number"]
     if n % 10 != 0:
         return []
-    polls = _scale_polls(history.get("polls", [])) + [r]
+    polls = _comparable_polls(history.get("polls", [])) + [r]
     avgs = [p["average"] for p in polls]
     since = datetime.fromisoformat(polls[0]["date"]).strftime("%d.%m.%Y")
     return ["", f"📈 Это {n}-й опрос. С {since}: средняя {round(statistics.mean(avgs), 1)}, "
@@ -421,9 +449,19 @@ def _jubilee_lines(r: dict, history: dict) -> list[str]:
 # Помощники
 # ---------------------------------------------------------------------------
 
-def _scale_polls(polls: list[dict]) -> list[dict]:
-    """Опросы текущей шкалы (с №11). У первых десяти шкала другая — сравнивать с ними нельзя."""
-    return [p for p in polls if "sober_count" in p]
+def _comparable_polls(polls: list[dict]) -> list[dict]:
+    """Все опросы в текущем формате записи.
+
+    В первых десяти (16.02–20.04) та же шкала, но другой порядок вариантов («Ещё пью»
+    стоял первым) и не сохранялась разбивка по трезвым — пересчитываем из voter_counts.
+    """
+    return [p if "sober_count" in p else _from_old_layout(p) for p in polls]
+
+
+def _from_old_layout(p: dict) -> dict:
+    old = p["voter_counts"]  # [ещё пью, 0/10, 1/10, …, 8–9/10, фантомная]
+    counts = old[1:IDX_PHANTOM] + [old[0], old[IDX_PHANTOM]]
+    return {**p, **compute_results(counts), "voter_counts": counts}
 
 
 def _month(p: dict) -> tuple[int, int]:
