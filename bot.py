@@ -40,7 +40,7 @@ from config import (
     TELEGRAM_PROXY,
     ZERO_OPTIONS,
 )
-from report import compute_results, format_summary
+from report import compute_results, format_summary, format_year_summary
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -377,13 +377,13 @@ async def _collect_votes(bot: Bot, poll_id: str, history: dict) -> dict:
     return votes
 
 
-def _is_last_poll_of_month(d) -> bool:
-    """Следующий опрос будет уже в другом месяце."""
-    for weeks in range(1, 4):
+def _next_poll_date(d):
+    """Дата следующего опроса — первый рабочий день одной из следующих недель."""
+    for weeks in range(1, 5):
         next_poll = get_first_working_day_of_week(d + timedelta(weeks=weeks))
         if next_poll is not None:
-            return next_poll.month != d.month
-    return True
+            return next_poll
+    return None
 
 
 async def close_poll(bot: Bot):
@@ -438,7 +438,11 @@ async def close_poll(bot: Bot):
         }
 
         poll_date = datetime.fromisoformat(current["date"]).date()
-        summary = format_summary(record, history, month_end=_is_last_poll_of_month(poll_date))
+        next_poll = _next_poll_date(poll_date)
+        month_end = next_poll is None or next_poll.month != poll_date.month
+        year_end = next_poll is None or next_poll.year != poll_date.year
+        summary = format_summary(record, history, month_end=month_end)
+        year_summary = format_year_summary(record, history) if year_end else None
 
         try:
             await _call_api("sendMessage (итоги)", lambda: bot.send_message(
@@ -457,6 +461,16 @@ async def close_poll(bot: Bot):
         history["current_poll"] = None
         save_history(history)
         logger.info("Опрос закрыт, среднее: %s", results["average"])
+
+        # Итоги года — отдельным сообщением; опрос уже закрыт, так что при сбое не повторяем
+        if year_summary:
+            try:
+                await _call_api("sendMessage (итоги года)", lambda: bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=year_summary,
+                ))
+            except TelegramError as e:
+                logger.error("Итоги года не доставлены: %s", e)
 
     except Exception:
         logger.exception("Ошибка обработки результатов")

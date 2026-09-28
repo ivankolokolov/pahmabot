@@ -275,7 +275,25 @@ def test_close_deleted_poll_keeps_state():
     assert get_history()["current_poll"]["message_id"] == 777
 
 
-def test_last_poll_of_month():
-    assert bot._is_last_poll_of_month(date(2026, 9, 28)) is True    # следующий — 5 октября
-    assert bot._is_last_poll_of_month(date(2026, 9, 21)) is False
-    assert bot._is_last_poll_of_month(date(2026, 12, 28)) is True   # следующий — 11 января
+def test_next_poll_date():
+    assert bot._next_poll_date(date(2026, 9, 28)) == date(2026, 10, 5)
+    assert bot._next_poll_date(date(2026, 9, 21)) == date(2026, 9, 28)
+    assert bot._next_poll_date(date(2026, 12, 28)) == date(2027, 1, 11)  # 4–8 января праздники
+
+
+def test_last_poll_of_year_sends_year_summary_separately():
+    fresh()
+    with_current_poll("2026-12-28T09:00:00+03:00")
+    b = FakeBot(updates=EIGHT_VOTERS)
+    run(bot.close_poll(b))
+    texts = [c["text"] for c in b.calls["send_message"]]
+    assert len(texts) == 2 and texts[1].startswith("🎆 Итоги 2026 года")
+
+
+def test_failed_year_summary_does_not_repeat_close():
+    fresh()
+    with_current_poll("2026-12-28T09:00:00+03:00")
+    b = FakeBot(updates=EIGHT_VOTERS, send_message=["ok", BadRequest("boom")])
+    run(bot.close_poll(b))
+    h = get_history()
+    assert h["current_poll"] is None and len(h["polls"]) == 1

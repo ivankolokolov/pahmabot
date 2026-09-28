@@ -30,6 +30,10 @@ MAX_FACTS = 3
 MAX_PERSONAL_FACTS = 2
 RECORD_WEIGHT = 6      # факты с таким весом (рекорды) показываем, даже если вид был на прошлой неделе
 
+MAX_MONTH_NOMINATIONS = 4
+
+MONTHS_NOM = ["", "январь", "февраль", "март", "апрель", "май", "июнь", "июль",
+              "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
 MONTHS_GEN = ["", "января", "февраля", "марта", "апреля", "мая", "июня", "июля",
               "августа", "сентября", "октября", "ноября", "декабря"]
 MONTHS_PREP = ["", "январе", "феврале", "марте", "апреле", "мае", "июне", "июле",
@@ -382,55 +386,224 @@ def _month_lines(r: dict, history: dict) -> list[str]:
     in_month = [p for p in polls if _month(p) == month]
     if len(in_month) < 2:
         return []
-
-    avg = round(statistics.mean(p["average"] for p in in_month), 1)
-    head = f"🗓 Итоги {MONTHS_GEN[month[1]]}: средняя {avg}"
     earlier = [p for p in polls if _month(p) < month]
-    if earlier:
-        prev_month = _month(earlier[-1])
-        prev_avg = round(statistics.mean(p["average"] for p in earlier if _month(p) == prev_month), 1)
-        head += f", в {MONTHS_PREP[prev_month[1]]} — {prev_avg}"
-    lines = ["", head + "."]
+    prev = [p for p in earlier if _month(p) == _month(earlier[-1])] if earlier else []
 
-    weeks = [p["votes"] for p in in_month if p.get("votes_complete")]
+    summary = f"Средняя {_mean_avg(in_month)}"
+    if prev:
+        summary += f" (в {MONTHS_PREP[_month(prev[0])[1]]} {_mean_avg(prev)})"
+    heaviest = max(in_month, key=lambda p: p["average"])
+    summary += (f" · трезвых {_sober_pct(in_month)}%"
+                f" · самая тяжёлая неделя — {_ddmm(heaviest)} ({heaviest['average']})")
+    lines = ["", f"🗓 Итоги {MONTHS_GEN[month[1]]}", summary]
+    return lines + _month_nominations(in_month, prev, history.get("people", {}))
+
+
+def _month_nominations(in_month: list[dict], prev: list[dict], people: dict) -> list[str]:
+    """Персональные номинации месяца: до MAX_MONTH_NOMINATIONS самых интересных."""
+    weeks = [p for p in in_month if p.get("votes_complete")]
     if len(weeks) < 2:
-        return lines
-    people = history.get("people", {})
-    per_person = {}
-    for votes in weeks:
-        for uid, o in votes.items():
-            per_person.setdefault(uid, []).append(o)
+        return []
 
-    means = {uid: statistics.mean(OPTION_VALUES[o] for o in opts if o in OPTION_VALUES)
-             for uid, opts in per_person.items()
-             if len(opts) >= 2 and any(o in OPTION_VALUES for o in opts)}
+    def names(uids):
+        return _join_names([people.get(uid, "без имени") for uid in uids])
+
+    per = _per_person(weeks)
+    if not per:
+        return []
+    scored = _scored(per)
+    means = {uid: statistics.mean(v for v, _, _ in s) for uid, s in scored.items() if len(s) >= 2}
+    candidates = []  # (вес, текст); при равном весе остаётся порядок добавления
+
     if means and max(means.values()) > 0:
         top = max(means.values())
         leaders = [uid for uid, m in means.items() if m == top]
         if len(leaders) <= 3:
-            names = _join_names([people.get(uid, "без имени") for uid in leaders])
-            lines.append(f"• Пахмист месяца — {names}: в среднем {round(top, 1)}.")
+            candidates.append((5, f"• Пахмист месяца — {names(leaders)}: в среднем {round(top, 1)}."))
 
-    always_sober = [uid for uid, opts in per_person.items()
-                    if len(opts) == len(weeks) and all(o == IDX_SOBER for o in opts)]
-    if 0 < len(always_sober) <= 3:
-        names = _join_names([people.get(uid, "без имени") for uid in always_sober])
-        lines.append(f"• Все недели месяца 0/10 — {names}.")
-    elif always_sober:
-        lines.append(f"• Все недели месяца 0/10 — {len(always_sober)} {_people(len(always_sober))}.")
+    peak = _peak(scored, people)
+    if peak:
+        value, text = peak
+        candidates.append((4 + value - 5, f"• Максимум месяца — {text}."))
+
+    spreads = {uid: (min(s), max(s)) for uid, s in scored.items()
+               if len(s) >= 2 and max(s)[0] - min(s)[0] >= 4}
+    if spreads:
+        uid = max(spreads, key=lambda u: spreads[u][1][0] - spreads[u][0][0])
+        lo, hi = spreads[uid]
+        candidates.append((4, f"• Самые большие качели — {names([uid])}: "
+                              f"от {_label(lo[1])} до {_label(hi[1])}."))
+
+    prev_weeks = [p for p in prev if p.get("votes_complete")]
+    if len(prev_weeks) >= 2:
+        prev_means = {uid: statistics.mean(v for v, _, _ in s)
+                      for uid, s in _scored(_per_person(prev_weeks)).items() if len(s) >= 2}
+        shifts = {uid: means[uid] - prev_means[uid] for uid in means if uid in prev_means}
+        if shifts:
+            down = min(shifts, key=shifts.get)
+            if shifts[down] <= -1.5:
+                candidates.append((4, f"• Больше всего снизилась средняя — {names([down])}: "
+                                      f"{round(prev_means[down], 1)} → {round(means[down], 1)}."))
+            up = max(shifts, key=shifts.get)
+            if shifts[up] >= 1.5:
+                candidates.append((4, f"• Больше всего выросла средняя — {names([up])}: "
+                                      f"{round(prev_means[up], 1)} → {round(means[up], 1)}."))
 
     if len(weeks) >= 3:
-        # Один и тот же ненулевой ответ все недели месяца; берём самую многочисленную группу
-        stable = {}
-        for uid, opts in per_person.items():
-            if len(opts) == len(weeks) and len(set(opts)) == 1 and IDX_SOBER < opts[0] < IDX_PHANTOM:
-                stable.setdefault(opts[0], []).append(uid)
-        if stable:
-            option, uids = max(stable.items(), key=lambda kv: len(kv[1]))
+        groups = {}
+        for uid, votes in per.items():
+            options = {o for o, _ in votes}
+            option = min(options)
+            if len(votes) == len(weeks) and len(options) == 1 and IDX_SOBER < option < IDX_PHANTOM:
+                groups.setdefault(option, []).append(uid)
+        if groups:
+            option, uids = max(groups.items(), key=lambda kv: len(kv[1]))
             if len(uids) <= 3:
-                names = _join_names([people.get(uid, "без имени") for uid in uids])
-                lines.append(f"• Каждую неделю {_label(option)} — {names}.")
-    return lines
+                candidates.append((3, f"• Каждую неделю {_label(option)} — {names(uids)}."))
+
+    sober = [uid for uid, votes in per.items()
+             if len(votes) == len(weeks) and all(o == IDX_SOBER for o, _ in votes)]
+    if 0 < len(sober) <= 3:
+        candidates.append((3, f"• Все недели 0/10 — {names(sober)}."))
+    elif sober:
+        candidates.append((2, f"• Все недели 0/10 — {len(sober)} {_people(len(sober))}."))
+
+    phantoms = {uid: sum(o == IDX_PHANTOM for o, _ in votes) for uid, votes in per.items()}
+    most = max(phantoms.values())
+    leaders = [uid for uid, c in phantoms.items() if c == most]
+    if most >= 2 and len(leaders) <= 3:
+        candidates.append((3, f"• Фантомная пахма {most} {_times(most)} — {names(leaders)}."))
+
+    regulars = sum(len(votes) == len(weeks) for votes in per.values())
+    if regulars:
+        candidates.append((1, f"• Голосовали каждую неделю — {regulars} {_people(regulars)}."))
+
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    return [text for _, text in candidates[:MAX_MONTH_NOMINATIONS]]
+
+
+def format_year_summary(record: dict, history: dict) -> str:
+    """Итоги года — отдельным сообщением после итогов последнего опроса года.
+
+    history — состояние до этого опроса, record — сам последний опрос.
+    """
+    year = _month(record)[0]
+    polls = [p for p in _comparable_polls(history.get("polls", [])) + [record] if _month(p)[0] == year]
+    n = len(polls)
+    heaviest = max(polls, key=lambda p: p["average"])
+    lightest = min(polls, key=lambda p: p["average"])
+    most = max(polls, key=lambda p: p["total_voters"])
+    least = min(polls, key=lambda p: p["total_voters"])
+    lines = [
+        f"🎆 Итоги {year} года",
+        "",
+        f"{n} {_polls(n)} · средняя {_mean_avg(polls)} · трезвых в среднем {_sober_pct(polls)}%",
+        f"Самая тяжёлая неделя — {_ddmm(heaviest)} ({heaviest['average']}), "
+        f"самая лёгкая — {_ddmm(lightest)} ({lightest['average']})",
+        f"Явка: максимум {most['total_voters']} ({_ddmm(most)}), "
+        f"минимум {least['total_voters']} ({_ddmm(least)})",
+    ]
+
+    by_month = {}
+    for p in polls:
+        by_month.setdefault(_month(p)[1], []).append(p["average"])
+    month_avgs = {m: statistics.mean(v) for m, v in by_month.items() if len(v) >= 2}
+    if len(month_avgs) >= 2:
+        hi = max(month_avgs, key=month_avgs.get)
+        lo = min(month_avgs, key=month_avgs.get)
+        if month_avgs[hi] > month_avgs[lo]:
+            lines.append(f"Самый тяжёлый месяц — {MONTHS_NOM[hi]}, самый лёгкий — {MONTHS_NOM[lo]}")
+
+    customs = [(c["votes"], c["text"], p) for p in polls for c in p.get("custom_options", []) if c["votes"] > 0]
+    if customs:
+        votes, text, p = max(customs, key=lambda c: c[0])
+        lines.append(f"Лучшее народное творчество — «{text}» ({votes} гол., {_ddmm(p)})")
+
+    return "\n".join(lines + _year_nominations(polls, history.get("people", {})))
+
+
+def _year_nominations(polls: list[dict], people: dict) -> list[str]:
+    weeks = [p for p in polls if p.get("votes_complete")]
+    if len(weeks) < 3:
+        return []
+    k = len(weeks)
+    need = -(-k // 2)  # хотя бы половина недель — чтобы не побеждали разовые голоса
+
+    def names(uids):
+        return _join_names([people.get(uid, "без имени") for uid in uids])
+
+    per = _per_person(weeks)
+    if not per:
+        return []
+    scored = _scored(per)
+    lines = ["", f"По людям — с {_ddmm(weeks[0])}, {k} {_polls(k)}:"]
+
+    means = {uid: statistics.mean(v for v, _, _ in s) for uid, s in scored.items() if len(s) >= need}
+    if means and max(means.values()) > 0:
+        top = max(means.values())
+        leaders = [uid for uid, m in means.items() if m == top]
+        if len(leaders) <= 3:
+            lines.append(f"• Пахмист года — {names(leaders)}: в среднем {round(top, 1)}.")
+
+    zeros = {uid: sum(o == IDX_SOBER for o, _ in votes) for uid, votes in per.items()}
+    best = max(zeros.values())
+    leaders = [uid for uid, c in zeros.items() if c == best]
+    if best > 0 and len(leaders) <= 3:
+        lines.append(f"• Больше всего недель 0/10 — {names(leaders)}: {best} из {k}.")
+
+    peak = _peak(scored, people)
+    if peak:
+        lines.append(f"• Максимум года — {peak[1]}.")
+
+    regulars = sum(len(votes) == k for votes in per.values())
+    if regulars:
+        lines.append(f"• Ни одного пропуска — {regulars} {_people(regulars)}.")
+
+    stable = {}
+    for uid, votes in per.items():
+        options = [o for o, _ in votes if IDX_SOBER < o < IDX_PHANTOM]
+        if options:
+            option = max(set(options), key=options.count)
+            if options.count(option) >= need:
+                stable[uid] = (options.count(option), option)
+    if stable:
+        uid = max(stable, key=lambda u: stable[u][0])
+        count, option = stable[uid]
+        lines.append(f"• Самый стабильный — {names([uid])}: {_label(option)} {count} {_times(count)} из {k}.")
+
+    return lines if len(lines) > 2 else []
+
+
+def _per_person(weeks: list[dict]) -> dict[str, list[tuple[int, str]]]:
+    """uid → [(вариант, дата опроса), …] по неделям с голосами."""
+    per = {}
+    for p in weeks:
+        for uid, option in p["votes"].items():
+            per.setdefault(uid, []).append((option, p["date"]))
+    return per
+
+
+def _scored(per: dict) -> dict[str, list[tuple[float, int, str]]]:
+    """Только голоса с баллом: uid → [(балл, вариант, дата), …] (без фантомной и своих вариантов)."""
+    scored = {}
+    for uid, votes in per.items():
+        s = [(OPTION_VALUES[o], o, d) for o, d in votes if o in OPTION_VALUES]
+        if s:
+            scored[uid] = s
+    return scored
+
+
+def _peak(scored: dict, people: dict) -> tuple[float, str] | None:
+    """Самый высокий балл периода (без «ещё пью»): (балл, «7/10: Коля (19.10)»)."""
+    votes = [(v, o, uid, d) for uid, s in scored.items() for v, o, d in s if o != IDX_STILL_DRUNK]
+    if not votes:
+        return None
+    best = max(v for v, *_ in votes)
+    holders = [(o, uid, d) for v, o, uid, d in votes if v == best]
+    if best < 5 or len(holders) > 3:
+        return None
+    who = _join_names([f"{people.get(uid, 'без имени')} ({_ddmm_iso(d)})" for _, uid, d in holders])
+    return best, f"{_label(holders[0][0])}: {who}"
 
 
 def _jubilee_lines(r: dict, history: dict) -> list[str]:
@@ -467,6 +640,23 @@ def _from_old_layout(p: dict) -> dict:
 def _month(p: dict) -> tuple[int, int]:
     d = datetime.fromisoformat(p["date"])
     return d.year, d.month
+
+
+def _ddmm(p: dict) -> str:
+    return _ddmm_iso(p["date"])
+
+
+def _ddmm_iso(iso: str) -> str:
+    return datetime.fromisoformat(iso).strftime("%d.%m")
+
+
+def _mean_avg(polls: list[dict]) -> float:
+    return round(statistics.mean(p["average"] for p in polls), 1)
+
+
+def _sober_pct(polls: list[dict]) -> int:
+    total = sum(p["total_voters"] for p in polls)
+    return round(sum(p["sober_count"] for p in polls) / total * 100) if total else 0
 
 
 def _run_length(seq: list, pred) -> int:
@@ -541,6 +731,14 @@ def _weeks(n: int) -> str:
 
 def _votes(n: int) -> str:
     return _plural(n, "голос", "голоса", "голосов")
+
+
+def _polls(n: int) -> str:
+    return _plural(n, "опрос", "опроса", "опросов")
+
+
+def _times(n: int) -> str:
+    return _plural(n, "раз", "раза", "раз")
 
 
 def _people(n: int) -> str:

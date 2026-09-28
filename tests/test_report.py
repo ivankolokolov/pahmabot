@@ -166,9 +166,11 @@ def test_month_block():
     ]}
     text = report.format_summary(rec(5, avg=1.1, date="2026-09-28", votes={"1": 0, "2": 3}),
                                  history, month_end=True)
-    assert "🗓 Итоги сентября: средняя 1.0, в августе — 1.2." in text
-    assert "• Пахмист месяца — Петя: в среднем 2.8." in text
-    assert "• Все недели месяца 0/10 — Маша." in text
+    block = month_block(text)
+    assert block[:2] == ["🗓 Итоги сентября",
+                         "Средняя 1.0 (в августе 1.2) · трезвых 50% · самая тяжёлая неделя — 28.09 (1.1)"]
+    assert "• Пахмист месяца — Петя: в среднем 2.8." in block
+    assert "• Все недели 0/10 — Маша." in block
 
 
 def test_all_templates_format():
@@ -198,3 +200,79 @@ def test_random_history_smoke():
         assert "{" not in text and "}" not in text
         assert len(facts_of(text)) <= 3
         polls.append(r)
+
+
+# ---------------------------------------------------------------------------
+# Итоги месяца и года
+# ---------------------------------------------------------------------------
+
+OCTOBER = {
+    "people": PEOPLE,
+    "polls": [
+        rec(1, avg=1.0, date="2026-09-21", votes={"1": 3, "2": 1, "3": 0, "4": 0}),
+        rec(2, avg=1.0, date="2026-09-28", votes={"1": 2, "2": 1, "3": 0, "4": 0}),
+        rec(3, avg=0.9, date="2026-10-05", votes={"1": 2, "2": 3, "3": 0, "4": 0}),
+        rec(4, avg=1.6, date="2026-10-12", votes={"1": 0, "2": 4, "3": 6, "4": 0}),
+        rec(5, avg=1.0, date="2026-10-19", votes={"1": 0, "2": 3, "3": 7, "4": 0}),
+    ],
+}
+
+
+def month_block(text):
+    return text[text.index("🗓"):].split("\n")
+
+
+def test_month_header():
+    text = report.format_summary(rec(6, avg=0.9, date="2026-10-26", votes={"1": 0, "2": 4, "3": 0, "4": 0}),
+                                 OCTOBER, month_end=True)
+    block = month_block(text)
+    assert block[0] == "🗓 Итоги октября"
+    assert block[1] == "Средняя 1.1 (в сентябре 1.0) · трезвых 50% · самая тяжёлая неделя — 12.10 (1.6)"
+
+
+def test_month_nominations_are_personal():
+    text = report.format_summary(rec(6, avg=0.9, date="2026-10-26", votes={"1": 0, "2": 4, "3": 0, "4": 0}),
+                                 OCTOBER, month_end=True)
+    bullets = [line for line in month_block(text) if line.startswith("•")]
+    assert "• Пахмист месяца — Петя: в среднем 3.5." in bullets
+    assert "• Максимум месяца — 7/10: Коля (19.10)." in bullets
+    assert "• Самые большие качели — Коля: от 0/10 до 7/10." in bullets
+    assert "• Больше всего снизилась средняя — Маша: 2.5 → 0.5." in bullets
+    assert len(bullets) <= 4
+
+
+def test_month_without_votes_has_only_header():
+    polls = [rec(i + 1, avg=1.0, date=d) for i, d in enumerate(["2026-10-05", "2026-10-12", "2026-10-19"])]
+    text = report.format_summary(rec(4, date="2026-10-26"), {"polls": polls}, month_end=True)
+    block = month_block(text)
+    assert block[0] == "🗓 Итоги октября" and not any(line.startswith("•") for line in block)
+
+
+YEAR = {
+    "people": PEOPLE,
+    "polls": [
+        old_layout(0.4, [0, 24, 5, 1, 0, 1, 0, 0, 0, 0, 3]) | {"date": "2026-02-16T09:00:00+03:00"},
+        old_layout(1.8, [3, 19, 3, 3, 2, 2, 1, 0, 0, 0, 1]) | {"date": "2026-03-16T09:00:00+03:00"},
+        rec(3, avg=1.0, date="2026-06-15", total=39),
+        rec(4, avg=1.2, date="2026-09-14", total=24),
+        rec(5, avg=0.9, date="2026-12-07", votes={"1": 0, "2": 8, "3": 2, "4": 0}),
+        rec(6, avg=1.1, date="2026-12-14", votes={"1": 0, "2": 3, "3": 2, "4": 1}),
+        rec(7, avg=1.0, date="2026-12-21", votes={"1": 0, "2": 4, "3": 2}),
+    ],
+}
+
+
+def test_year_summary():
+    last = rec(8, avg=1.4, date="2026-12-28", votes={"1": 0, "2": 3, "3": 2, "4": 0})
+    last["custom_options"] = [{"text": "Отдыхаю", "votes": 3}]
+    lines = report.format_year_summary(last, YEAR).split("\n")
+    assert lines[0] == "🎆 Итоги 2026 года"
+    assert lines[2].startswith("8 опросов · средняя 1.1 · трезвых ")
+    assert "Самая тяжёлая неделя — 16.03 (1.8), самая лёгкая — 16.02 (0.4)" in lines
+    assert "Явка: максимум 39 (15.06), минимум 24 (14.09)" in lines
+    assert "Лучшее народное творчество — «Отдыхаю» (3 гол., 28.12)" in lines
+    assert "По людям — с 07.12, 4 опроса:" in lines
+    assert "• Пахмист года — Петя: в среднем 4.6." in lines
+    assert "• Больше всего недель 0/10 — Маша: 4 из 4." in lines
+    assert "• Максимум года — 8–9/10: Петя (07.12)." in lines
+    assert "• Самый стабильный — Коля: 2/10 4 раза из 4." in lines
