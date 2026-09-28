@@ -15,9 +15,12 @@ TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "")
 POLL_HOUR = 9    # Опрос в 9:00
 CLOSE_HOUR = 18  # Закрытие в 18:00
 
-# Повторы отправки опроса при временных ошибках сети/Telegram API
-SEND_POLL_MAX_ATTEMPTS = 4
-SEND_POLL_RETRY_DELAY_SECONDS = 20
+# Запросы к Telegram API. По умолчанию PTB ждёт ответ 5 сек — Telegram иногда
+# отвечает дольше, а повтор уже выполненного запроса задваивает опрос.
+API_READ_TIMEOUT_SECONDS = 30
+# Повторы — только когда запрос точно не дошёл до Telegram (ошибка соединения, RetryAfter)
+API_MAX_ATTEMPTS = 4
+API_RETRY_DELAY_SECONDS = 20
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
