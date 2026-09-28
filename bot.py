@@ -3,6 +3,8 @@
 ПахмаБот — еженедельный понедельничный опрос о состоянии пахмы.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -12,7 +14,7 @@ from datetime import datetime, timedelta
 
 import httpx
 from telegram import Bot, Poll
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import Conflict, RetryAfter, TelegramError
 from telegram.request import HTTPXRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -22,7 +24,6 @@ from config import (
     API_MAX_ATTEMPTS,
     API_READ_TIMEOUT_SECONDS,
     API_RETRY_DELAY_SECONDS,
-    AVG_COMMENTS,
     BOT_TOKEN,
     CHANNEL_ID,
     CLOSE_HOUR,
@@ -37,13 +38,12 @@ from config import (
     POLL_HOUR,
     POLL_OPTIONS,
     POLL_TAGLINES,
-    REVEAL_PHRASES,
     RU_HOLIDAYS,
     SEASONAL_MESSAGES,
-    SUMMARY_HEADERS,
     TELEGRAM_PROXY,
     ZERO_OPTIONS,
 )
+from report import format_summary
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -199,168 +199,6 @@ def compute_results(voter_counts: list[int]) -> dict:
         "phantom_count": voter_counts[IDX_PHANTOM],
         "still_drunk": voter_counts[IDX_STILL_DRUNK],
     }
-
-
-# ---------------------------------------------------------------------------
-# Формирование текста итогов
-# ---------------------------------------------------------------------------
-
-def format_summary(results: dict, history: dict) -> str:
-    """Формирует текст итогового сообщения."""
-    avg = results["average"]
-    total = results["total_voters"]
-    phantom = results["phantom_count"]
-    drunk = results["still_drunk"]
-    sober = results["sober_count"]
-    hangover_count = results["hangover_count"]
-    hangover_avg = results["hangover_avg"]
-    custom_options = results.get("custom_options", [])
-    polls = history.get("polls", [])
-    poll_number = len(polls) + 1
-
-    lines = []
-
-    lines.append(random.choice(REVEAL_PHRASES))
-    lines.append("")
-    lines.append(f"{random.choice(SUMMARY_HEADERS)} (#{poll_number})")
-    lines.append("")
-    lines.append(f"Проголосовали: {_voters_word(total)}.")
-
-    if total > 0:
-        sober_pct = round(sober / total * 100)
-        with_pahma = hangover_count + drunk
-        if with_pahma > 0:
-            lines.append(f"Трезвых: {sober} ({sober_pct}%), с пахмой: {with_pahma}.")
-        else:
-            lines.append(f"Трезвых: {sober} ({sober_pct}%).")
-
-    lines.append("")
-    lines.append(f"Средняя пахма по чату: {avg}/10")
-    if hangover_count > 0:
-        lines.append(f"Средняя среди похмельных: {hangover_avg}/10")
-
-    if drunk > 0:
-        lines.append(f"Ещё пьют: {drunk} чел. 🍻")
-
-    if phantom > 0:
-        word = _people_word(phantom)
-        lines.append(f"Фантомная пахма: {phantom} {word} 👻")
-
-    # Сравнение с прошлой неделей
-    prev = polls[-1] if polls else None
-    if prev is not None:
-        prev_avg = prev["average"]
-        diff = round(avg - prev_avg, 1)
-        if abs(diff) >= 0.5:
-            lines.append("")
-            if diff > 0:
-                if avg >= 7:
-                    lines.append(f"⚠️ Тяжёлая неделя! +{diff} к прошлой ({prev_avg}).")
-                else:
-                    lines.append(f"📈 Пахма подросла: +{diff} к прошлой неделе ({prev_avg}).")
-            else:
-                lines.append(f"📉 Полегчало: {diff} к прошлой неделе ({prev_avg}).")
-
-        prev_hangover = prev.get("hangover_count", 0)
-        if hangover_count > 0 and prev_hangover > 0:
-            diff_h = hangover_count - prev_hangover
-            if abs(diff_h) >= 2:
-                if diff_h > 0:
-                    lines.append(f"Похмельных стало больше: {hangover_count} vs {prev_hangover}.")
-                else:
-                    lines.append(f"Похмельных стало меньше: {hangover_count} vs {prev_hangover}.")
-
-    # Рекорды и антирекорды
-    all_avgs = [p["average"] for p in polls if "average" in p]
-    if all_avgs:
-        if avg > 0 and avg >= max(all_avgs):
-            lines.append("🏆 Рекорд пахмы за всё время!")
-        elif avg <= min(all_avgs) and len(all_avgs) >= 3:
-            lines.append("🧊 Антирекорд! Самая трезвая неделя за всю историю.")
-
-        if len(all_avgs) >= 4:
-            recent_4 = all_avgs[-4:]
-            if avg > 0 and avg == max(recent_4):
-                lines.append("Самая тяжёлая неделя за последний месяц.")
-            elif avg == min(recent_4) and avg < max(recent_4):
-                lines.append("Самая лёгкая неделя за месяц.")
-
-    # Серия трезвости
-    sober_streak = _count_sober_streak(polls, avg)
-    if sober_streak >= 2:
-        lines.append(f"🧘 Серия трезвости: {sober_streak} недель подряд средняя < 1!")
-
-    # Пользовательские варианты
-    voted_custom = [c for c in custom_options if c["votes"] > 0]
-    if voted_custom:
-        lines.append("")
-        lines.append("✏️ Народное творчество:")
-        for c in voted_custom:
-            lines.append(f'  • «{c["text"]}» — {c["votes"]} гол.')
-    elif custom_options:
-        lines.append("")
-        lines.append("✏️ Народное творчество было, но никто не проголосовал.")
-
-    # Комментарий — по средней среди похмельных (если есть), иначе по общей
-    comment_avg = hangover_avg if hangover_count > 0 else avg
-    comment = _avg_comment(comment_avg)
-    if comment:
-        lines.append("")
-        lines.append(comment)
-
-    # Историческая статистика (каждые 10 опросов)
-    if poll_number >= 5 and poll_number % 10 == 0:
-        avgs_with_current = all_avgs + [avg]
-        all_time_avg = round(sum(avgs_with_current) / len(avgs_with_current), 1)
-        lines.append("")
-        lines.append(f"📈 За {poll_number} опросов: средняя {all_time_avg}/10, "
-                     f"макс. {max(avgs_with_current)}, мин. {min(avgs_with_current)}.")
-
-    return "\n".join(lines)
-
-
-def _count_sober_streak(polls: list[dict], current_avg: float) -> int:
-    """Считает текущую серию недель со средней < 1 (включая текущую)."""
-    if current_avg >= 1:
-        return 0
-    streak = 1
-    for p in reversed(polls):
-        if p.get("average", 10) < 1:
-            streak += 1
-        else:
-            break
-    return streak
-
-
-def _avg_comment(avg: float) -> str | None:
-    if avg <= 1:
-        key = "sober"
-    elif avg <= 2.5:
-        key = "light"
-    elif avg <= 4:
-        key = "normal"
-    elif avg <= 6:
-        key = "serious"
-    elif avg <= 8:
-        key = "heavy"
-    else:
-        key = "critical"
-    comments = AVG_COMMENTS.get(key, [])
-    return random.choice(comments) if comments else None
-
-
-def _voters_word(n: int) -> str:
-    return f"{n} {_people_word(n)}"
-
-
-def _people_word(n: int) -> str:
-    """Склонение слова «человек»."""
-    if 11 <= n % 100 <= 19:
-        return "человек"
-    last = n % 10
-    if 2 <= last <= 4:
-        return "человека"
-    return "человек"
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +364,62 @@ async def _fetch_final_poll(bot: Bot, current: dict) -> Poll | None:
     return fwd.poll
 
 
+# Доля голосов «по людям» от итога Telegram, при которой неделя считается полной.
+# Меньше — значит, часть голосов не дошла (бот лежал больше суток), и персональные
+# серии эту неделю пропускают. Голоса анонимных админов в людей не попадают никогда.
+VOTES_COMPLETE_SHARE = 0.9
+
+
+async def _collect_votes(bot: Bot, poll_id: str, history: dict) -> dict:
+    """Забирает из очереди апдейтов голоса за опрос: {user_id: индекс варианта}.
+
+    Telegram хранит апдейты сутки, а опрос открыт с утра до вечера — поэтому голоса
+    можно забрать разом при закрытии. Каждая страница сохраняется в current_poll
+    до следующего запроса (он подтверждает предыдущую страницу), так что повтор
+    закрытия уже прочитанное не теряет. Последний голос человека побеждает.
+    """
+    current = history["current_poll"]
+    votes = current.setdefault("votes", {})
+    people = history.setdefault("people", {})
+    offset = None
+    try:
+        while True:
+            updates = await _call_api("getUpdates", lambda: bot.get_updates(
+                offset=offset,
+                limit=100,
+                timeout=0,
+                allowed_updates=["poll_answer"],
+            ))
+            if not updates:
+                break
+            for update in updates:
+                answer = update.poll_answer
+                if not answer or not answer.user or answer.poll_id != poll_id:
+                    continue
+                uid = str(answer.user.id)
+                if answer.option_ids:
+                    votes[uid] = answer.option_ids[0]
+                    people[uid] = answer.user.full_name
+                else:
+                    votes.pop(uid, None)
+            offset = updates[-1].update_id + 1
+            save_history(history)
+    except Conflict as e:
+        logger.error("getUpdates: %s — запущен второй экземпляр бота или установлен вебхук.", e)
+    except TelegramError as e:
+        logger.error("Не удалось забрать голоса: %s", e)
+    return votes
+
+
+def _is_last_poll_of_month(d) -> bool:
+    """Следующий опрос будет уже в другом месяце."""
+    for weeks in range(1, 4):
+        next_poll = get_first_working_day_of_week(d + timedelta(weeks=weeks))
+        if next_poll is not None:
+            return next_poll.month != d.month
+    return True
+
+
 async def close_poll(bot: Bot):
     """Останавливает активный опрос (если он есть), собирает результаты и отправляет итоги."""
     history = load_history()
@@ -537,6 +431,8 @@ async def close_poll(bot: Bot):
     if poll is None:
         logger.error("Не удалось закрыть опрос и получить данные для итогов.")
         return
+
+    votes = await _collect_votes(bot, poll.id, history)
 
     try:
         voter_counts = [opt.voter_count for opt in poll.options]
@@ -550,7 +446,12 @@ async def close_poll(bot: Bot):
                 })
 
         results = compute_results(voter_counts)
-        results["custom_options"] = custom_options
+        total = results["total_voters"]
+        complete = total > 0 and len(votes) >= total * VOTES_COMPLETE_SHARE
+        logger.info(
+            "Голоса по людям: %s из %s%s", len(votes), total,
+            "" if complete else " — неполные, персональные факты пропускаю",
+        )
 
         poll_number = len(history.get("polls", [])) + 1
         record = {
@@ -566,9 +467,12 @@ async def close_poll(bot: Bot):
             "still_drunk": results["still_drunk"],
             "voter_counts": voter_counts[:num_standard],
             "custom_options": custom_options,
+            "votes": votes,
+            "votes_complete": complete,
         }
 
-        summary = format_summary(results, history)
+        poll_date = datetime.fromisoformat(current["date"]).date()
+        summary = format_summary(record, history, month_end=_is_last_poll_of_month(poll_date))
 
         try:
             await _call_api("sendMessage (итоги)", lambda: bot.send_message(
@@ -645,13 +549,11 @@ async def main():
 
     if TELEGRAM_PROXY:
         logger.info("Использую прокси для Telegram API.")
-    bot = Bot(
-        token=BOT_TOKEN,
-        request=HTTPXRequest(
-            read_timeout=API_READ_TIMEOUT_SECONDS,
-            proxy=TELEGRAM_PROXY or None,
-        ),
-    )
+    def make_request():
+        return HTTPXRequest(read_timeout=API_READ_TIMEOUT_SECONDS, proxy=TELEGRAM_PROXY or None)
+
+    # getUpdates (сбор голосов) ходит через отдельный пул соединений
+    bot = Bot(token=BOT_TOKEN, request=make_request(), get_updates_request=make_request())
 
     me = await bot.get_me()
     logger.info("Бот запущен: @%s (%s)", me.username, me.first_name)
