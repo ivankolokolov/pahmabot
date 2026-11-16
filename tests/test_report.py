@@ -4,7 +4,7 @@ import random
 import re
 
 import report
-from config import FACT_TEXTS, VERDICT_TEXTS
+from config import FACT_TEXTS, REMINDER_TEXTS, VERDICT_TEXTS
 
 
 def rec(n, avg=1.0, date="2026-09-07", total=30, sober=15, hangover=13, drunk=1, phantom=1,
@@ -316,3 +316,24 @@ def test_custom_option_text_is_escaped():
     text = report.format_summary(r, {"polls": weeks([1.0] * 4)})
     assert "«&lt;b&gt;пиво&lt;/b&gt; &amp; чипсы» — 2 гол." in text
     assert "«<b>пиво</b> & чипсы» — 2 гол." in report.plain_text(text)
+
+
+# ---------------------------------------------------------------------------
+# Напоминание за час до закрытия
+# ---------------------------------------------------------------------------
+
+def test_reminder_lists_everyone_sorted_with_link():
+    people = {"1": "Яна", "2": "алекс", "3": "Борис"}
+    [text] = report.format_reminder(["1", "2", "3"], people, "https://t.me/c/123/777")
+    lines = text.split("\n")
+    assert lines[0] in REMINDER_TEXTS
+    assert report.plain_text(lines[2]) == "алекс, Борис и Яна"
+    assert lines[-1] == '👉 <a href="https://t.me/c/123/777">К опросу</a>'
+
+
+def test_long_reminder_is_split():
+    people = {str(i): f"Человек {i:03}" for i in range(120)}
+    messages = report.format_reminder(list(people), people)
+    assert [m.count("tg://user") for m in messages] == [50, 50, 20]
+    assert messages[0].split("\n")[0] in REMINDER_TEXTS and "К опросу" not in messages[0]
+    assert report.format_reminder([], people) == []

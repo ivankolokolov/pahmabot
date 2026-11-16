@@ -13,9 +13,9 @@ import random
 from datetime import datetime, timedelta
 
 import httpx
-from telegram import Bot, Poll
-from telegram.constants import ParseMode
-from telegram.error import Conflict, RetryAfter, TelegramError
+from telegram import Bot, Poll, ReplyParameters
+from telegram.constants import ChatMemberStatus, ParseMode
+from telegram.error import BadRequest, Conflict, RetryAfter, TelegramError
 from telegram.request import HTTPXRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -36,12 +36,13 @@ from config import (
     POLL_HOUR,
     POLL_OPTIONS,
     POLL_TAGLINES,
+    REMIND_HOUR,
     RU_HOLIDAYS,
     SEASONAL_MESSAGES,
     TELEGRAM_PROXY,
     ZERO_OPTIONS,
 )
-from report import compute_results, format_summary, format_year_summary
+from report import compute_results, format_reminder, format_summary, format_year_summary
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -285,6 +286,7 @@ async def send_poll(bot: Bot):
     history["current_poll"] = {
         "message_id": message.message_id,
         "chat_id": message.chat.id,
+        "poll_id": message.poll.id,  # по нему голоса из очереди апдейтов относятся к опросу
         "date": datetime.now(MSK).isoformat(),
         "greeting": greeting,
     }
@@ -378,6 +380,99 @@ async def _collect_votes(bot: Bot, poll_id: str, history: dict) -> dict:
     return votes
 
 
+# Ответы getChatMember, означающие «человека в чате нет»
+_NOT_IN_CHAT_ERRORS = ("participant_id_invalid", "user not found", "member not found")
+_IN_CHAT_STATUSES = {ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER}
+
+
+async def _chat_members(bot: Bot, chat_id: int, uids: list[str]) -> set[str] | None:
+    """Кто из этих людей сейчас состоит в чате; None — проверить нельзя.
+
+    Опрос могут переслать, и тогда голосовать может кто угодно — такие голоса не наши.
+    Telegram честно отвечает про участников, только если бот — админ чата: иначе на
+    многих настоящих участников приходит Participant_id_invalid. Поэтому без прав
+    админа не проверяем вовсе. На непонятную ошибку по человеку считаем его
+    участником: лучше лишний голос, чем итоги, обнулённые сбоем.
+    """
+    try:
+        me = await _call_api("getMe", bot.get_me)
+        own = await _call_api("getChatMember (бот)", lambda: bot.get_chat_member(chat_id=chat_id, user_id=me.id))
+    except TelegramError as e:
+        logger.warning("Не удалось проверить права бота в чате: %s", e)
+        return None
+    if own.status not in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR):
+        logger.warning("Бот не админ чата — Telegram не скажет, кто в нём состоит; участников не проверяю.")
+        return None
+
+    members = set()
+    for uid in uids:
+        try:
+            member = await _call_api("getChatMember", lambda uid=uid: bot.get_chat_member(
+                chat_id=chat_id, user_id=int(uid)))
+        except TelegramError as e:
+            if not (isinstance(e, BadRequest) and any(s in str(e).lower() for s in _NOT_IN_CHAT_ERRORS)):
+                logger.warning("getChatMember %s: %s — считаю участником чата.", uid, e)
+                members.add(uid)
+            continue
+        if member.status in _IN_CHAT_STATUSES or (
+                member.status == ChatMemberStatus.RESTRICTED and member.is_member):
+            members.add(uid)
+    return members
+
+
+def _poll_link(current: dict) -> str | None:
+    """Ссылка на сообщение с опросом — есть только у супергрупп (id вида -100…)."""
+    chat = str(current["chat_id"])
+    return f"https://t.me/c/{chat[4:]}/{current['message_id']}" if chat.startswith("-100") else None
+
+
+async def remind_poll(bot: Bot):
+    """За час до закрытия тегает участников чата, которые ещё не проголосовали.
+
+    Список участников группы ботам недоступен, поэтому «все» — это люди, которые
+    хоть раз голосовали (history["people"]) и до сих пор в чате.
+    """
+    history = load_history()
+    current = history.get("current_poll")
+    if not current or current.get("reminded"):
+        return
+    if datetime.fromisoformat(current["date"]).date() != datetime.now(MSK).date():
+        return  # зависший опрос прошлой недели — его закроет close_poll
+    if "poll_id" not in current:
+        logger.warning("У опроса нет poll_id (отправлен до обновления) — напоминание пропускаю.")
+        return
+
+    votes = await _collect_votes(bot, current["poll_id"], history)
+    people = history.get("people", {})
+    waiting = [uid for uid in people if uid not in votes]
+    members = await _chat_members(bot, current["chat_id"], waiting)
+    if members is None:
+        logger.warning("Напоминание пропускаю: без прав админа не отличить участников чата от посторонних.")
+        return
+    pending = [uid for uid in waiting if uid in members]
+
+    # Отмечаем до отправки: лучше пропустить напоминание, чем тегнуть всех дважды
+    current["reminded"] = True
+    save_history(history)
+    if not pending:
+        logger.info("Напоминание не нужно: все известные участники чата проголосовали.")
+        return
+
+    for text in format_reminder(pending, people, _poll_link(current)):
+        try:
+            await _call_api("sendMessage (напоминание)", lambda text=text: bot.send_message(
+                chat_id=current["chat_id"],
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_parameters=ReplyParameters(
+                    message_id=current["message_id"], allow_sending_without_reply=True),
+            ))
+        except TelegramError as e:
+            logger.error("Напоминание не отправлено: %s", e)
+            return
+    logger.info("Напоминание отправлено: %s не проголосовали.", len(pending))
+
+
 def _next_poll_date(d):
     """Дата следующего опроса — первый рабочий день одной из следующих недель."""
     for weeks in range(1, 5):
@@ -400,16 +495,27 @@ async def close_poll(bot: Bot):
         return
 
     votes = await _collect_votes(bot, poll.id, history)
+    # Опрос могли переслать за пределы чата — голоса посторонних вычитаем из итогов
+    members = await _chat_members(bot, current["chat_id"], list(votes))
+    outsiders = {} if members is None else {uid: o for uid, o in votes.items() if uid not in members}
+    votes = {uid: o for uid, o in votes.items() if uid not in outsiders}
+    if outsiders:
+        people = history.get("people", {})
+        logger.info("Голоса не из чата (%s) не учитываю: %s", len(outsiders),
+                    ", ".join(people.get(uid, uid) for uid in outsiders))
 
     try:
         voter_counts = [opt.voter_count for opt in poll.options]
+        for option in outsiders.values():
+            if option < len(voter_counts):
+                voter_counts[option] = max(0, voter_counts[option] - 1)
         num_standard = len(POLL_OPTIONS)
         custom_options = []
         for i, opt in enumerate(poll.options):
             if i >= num_standard:
                 custom_options.append({
                     "text": opt.text,
-                    "votes": opt.voter_count,
+                    "votes": voter_counts[i],
                 })
 
         results = compute_results(voter_counts)
@@ -496,6 +602,16 @@ def create_scheduler(bot: Bot) -> AsyncIOScheduler:
         misfire_grace_time=3600,
     )
 
+    # В REMIND_HOUR — теги тех, кто ещё не проголосовал (если сегодня был опрос)
+    scheduler.add_job(
+        remind_poll,
+        CronTrigger(day_of_week="mon-fri", hour=REMIND_HOUR, minute=0, timezone=MSK),
+        args=[bot],
+        id="remind_poll",
+        name="Напомнить о голосовании",
+        misfire_grace_time=1800,
+    )
+
     # Каждый будний день в CLOSE_HOUR — закрытие, если есть активный опрос
     scheduler.add_job(
         close_poll,
@@ -520,6 +636,8 @@ async def recover_after_restart(bot: Bot):
         await close_poll(bot)
     elif hour >= POLL_HOUR:
         await maybe_send_poll(bot)
+        if hour >= REMIND_HOUR:
+            await remind_poll(bot)
 
 
 async def main():

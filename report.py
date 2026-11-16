@@ -1,4 +1,4 @@
-"""Итоги опроса: базовые цифры, пахмограф, факты недели и вердикт.
+"""Итоги опроса (базовые цифры, пахмограф, факты недели, вердикт) и напоминание.
 
 Только чистые функции над записями history.json — без Telegram, чтобы отчёт можно было
 тестировать и смотреть превью на реальной истории (tools/preview_report.py).
@@ -22,6 +22,7 @@ from config import (
     IDX_STILL_DRUNK,
     OPTION_VALUES,
     POLL_OPTIONS,
+    REMINDER_TEXTS,
     SUMMARY_HEADERS,
     VERDICT_TEXTS,
 )
@@ -36,6 +37,7 @@ MAX_PERSONAL_FACTS = 2
 RECORD_WEIGHT = 6      # факты с таким весом (рекорды) показываем, даже если вид был на прошлой неделе
 
 MAX_MONTH_NOMINATIONS = 4
+REMIND_TAGS_PER_MESSAGE = 50  # в одном сообщении Telegram размечает ограниченное число ссылок
 
 MONTHS_NOM = ["", "январь", "февраль", "март", "апрель", "май", "июнь", "июль",
               "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
@@ -106,6 +108,21 @@ def format_summary(record: dict, history: dict, month_end: bool = False) -> str:
         lines += _month_lines(record, history)
     lines += _jubilee_lines(record, history)
     return "\n".join(lines)
+
+
+def format_reminder(uids: list[str], people: dict, link: str | None = None) -> list[str]:
+    """Напоминание за час до закрытия: теги всех, кто ещё не проголосовал.
+
+    Тегов может быть много — режем на несколько сообщений.
+    """
+    uids = sorted(uids, key=lambda uid: (people.get(uid) or "").casefold())
+    chunks = [uids[i:i + REMIND_TAGS_PER_MESSAGE] for i in range(0, len(uids), REMIND_TAGS_PER_MESSAGE)]
+    messages = [_names(chunk, people) for chunk in chunks]
+    if messages:
+        messages[0] = f"{_esc(random.choice(REMINDER_TEXTS))}\n\n{messages[0]}"
+        if link:
+            messages[0] += f'\n\n👉 <a href="{_esc(link)}">К опросу</a>'
+    return messages
 
 
 # ---------------------------------------------------------------------------
