@@ -122,7 +122,8 @@ def test_personal_sober_streak():
     history = {"people": PEOPLE, "polls": [
         rec(i + 1, votes={"1": 0, "2": 1}) for i in range(3)]}
     text = report.format_summary(rec(4, votes={"1": 0, "2": 2}), history)
-    assert "Маша — 4 недели подряд 0/10." in text
+    assert '<a href="tg://user?id=1">Маша</a> — 4 недели подряд 0/10.' in text
+    assert "Маша — 4 недели подряд 0/10." in report.plain_text(text)
 
 
 def test_personal_facts_need_complete_votes():
@@ -136,7 +137,7 @@ def test_person_top_replaces_anonymous_max():
     counts = [15, 6, 4, 2, 1, 0, 0, 1, 0, 1, 1]
     history = {"people": PEOPLE, "polls": weeks([1.0] * 4)}
     random.seed(3)
-    text = report.format_summary(rec(5, counts=counts, votes={"2": 7, "1": 0}), history)
+    text = report.plain_text(report.format_summary(rec(5, counts=counts, votes={"2": 7, "1": 0}), history))
     assert "Максимум недели — 7/10: Петя." in text
     assert "(1 человек)" not in text
 
@@ -144,7 +145,7 @@ def test_person_top_replaces_anonymous_max():
 def test_person_jump():
     history = {"people": PEOPLE, "polls": [
         rec(i + 1, votes={"3": o}) for i, o in enumerate([0, 0, 1])]}
-    text = report.format_summary(rec(4, votes={"3": 5}), history)
+    text = report.plain_text(report.format_summary(rec(4, votes={"3": 5}), history))
     assert "Коля — 5/10, хотя обычно 0–1." in text
 
 
@@ -154,7 +155,8 @@ def test_newcomers_only_after_history_accumulates():
 
     later = {"people": PEOPLE, "polls": [rec(i + 1, votes={"1": 0}) for i in range(4)]}
     random.seed(0)
-    assert "Первый голос в опросе: Саша." in report.format_summary(rec(5, votes={"1": 0, "4": 1}), later)
+    assert "Первый голос в опросе: Саша." in report.plain_text(
+        report.format_summary(rec(5, votes={"1": 0, "4": 1}), later))
 
 
 def test_month_block():
@@ -185,7 +187,7 @@ def test_all_templates_format():
 def test_random_history_smoke():
     """Год случайных недель с голосами: отчёт строится, фактов не больше трёх, всё подставлено."""
     rng = random.Random(42)
-    people = {str(i): f"Человек {i}" for i in range(40)}
+    people = {str(i): f"Человек <{i}> & Co" for i in range(40)}
     polls = []
     history = {"people": people, "polls": polls}
     for n in range(1, 53):
@@ -198,6 +200,7 @@ def test_random_history_smoke():
                 phantom=counts[10], counts=counts, votes=votes, complete=rng.random() < 0.9)
         text = report.format_summary(r, history, month_end=n % 4 == 0)
         assert "{" not in text and "}" not in text
+        assert not re.search(r"<(?!/?a\b)|&(?!(lt|gt|amp);)", text)  # кроме тегов людей всё экранировано
         assert len(facts_of(text)) <= 3
         polls.append(r)
 
@@ -219,6 +222,7 @@ OCTOBER = {
 
 
 def month_block(text):
+    text = report.plain_text(text)
     return text[text.index("🗓"):].split("\n")
 
 
@@ -265,7 +269,7 @@ YEAR = {
 def test_year_summary():
     last = rec(8, avg=1.4, date="2026-12-28", votes={"1": 0, "2": 3, "3": 2, "4": 0})
     last["custom_options"] = [{"text": "Отдыхаю", "votes": 3}]
-    lines = report.format_year_summary(last, YEAR).split("\n")
+    lines = report.plain_text(report.format_year_summary(last, YEAR)).split("\n")
     assert lines[0] == "🎆 Итоги 2026 года"
     assert lines[2].startswith("8 опросов · средняя 1.1 · трезвых ")
     assert "Самая тяжёлая неделя — 16.03 (1.8), самая лёгкая — 16.02 (0.4)" in lines
@@ -276,3 +280,39 @@ def test_year_summary():
     assert "• Больше всего недель 0/10 — Маша: 4 из 4." in lines
     assert "• Максимум года — 8–9/10: Петя (07.12)." in lines
     assert "• Самый стабильный — Коля: 2/10 4 раза из 4." in lines
+
+
+# ---------------------------------------------------------------------------
+# Теги людей
+# ---------------------------------------------------------------------------
+
+def test_people_are_tagged_by_id():
+    assert report._mention("42", {"42": "Маша"}) == '<a href="tg://user?id=42">Маша</a>'
+    assert report._mention("42", {}) == '<a href="tg://user?id=42">без имени</a>'
+    assert report._mention("42", {"42": "<Вася & Co>"}) == '<a href="tg://user?id=42">&lt;Вася &amp; Co&gt;</a>'
+
+
+def test_all_names_are_listed_without_and_n_more():
+    people = {str(i): f"Человек {i}" for i in range(1, 7)}
+    assert report._names(list(people), people).count("tg://user?id=") == 6
+    assert report.plain_text(report._names(list(people), people)) == \
+        "Человек 1, Человек 2, Человек 3, Человек 4, Человек 5 и Человек 6"
+
+
+def test_many_newcomers_are_all_tagged():
+    people = {str(i): f"Человек {i}" for i in range(1, 8)}
+    history = {"people": people, "polls": [rec(i + 1, votes={"1": 0}) for i in range(4)]}
+    random.seed(0)
+    text = report.format_summary(rec(5, votes={uid: 0 for uid in people}), history)
+    assert "и ещё" not in text
+    assert "Первый голос в опросе: Человек 2, Человек 3, Человек 4, Человек 5, Человек 6 и Человек 7." \
+        in report.plain_text(text)
+    assert all(f'tg://user?id={i}"' in text for i in range(2, 8))
+
+
+def test_custom_option_text_is_escaped():
+    r = rec(5)
+    r["custom_options"] = [{"text": "<b>пиво</b> & чипсы", "votes": 2}]
+    text = report.format_summary(r, {"polls": weeks([1.0] * 4)})
+    assert "«&lt;b&gt;пиво&lt;/b&gt; &amp; чипсы» — 2 гол." in text
+    assert "«<b>пиво</b> & чипсы» — 2 гол." in report.plain_text(text)

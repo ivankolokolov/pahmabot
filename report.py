@@ -2,11 +2,16 @@
 
 Только чистые функции над записями history.json — без Telegram, чтобы отчёт можно было
 тестировать и смотреть превью на реальной истории (tools/preview_report.py).
+
+Текст — HTML-разметка Telegram: люди отмечены тегами (ссылками tg://user?id=…, чтобы
+тег работал и без username), всё остальное экранировано.
 """
 
 from __future__ import annotations
 
+import html
 import random
+import re
 import statistics
 from datetime import datetime
 
@@ -76,7 +81,7 @@ def format_summary(record: dict, history: dict, month_end: bool = False) -> str:
     """
     polls = _comparable_polls(history.get("polls", []))
 
-    lines = [f"{random.choice(SUMMARY_HEADERS)} (#{record['poll_number']})"]
+    lines = [f"{_esc(random.choice(SUMMARY_HEADERS))} (#{record['poll_number']})"]
     lines += _base_lines(record)
 
     spark_values = [p["average"] for p in polls[-(SPARK_WEEKS - 1):]] + [record["average"]]
@@ -139,7 +144,7 @@ def _sparkline(values: list[float]) -> str:
 # ---------------------------------------------------------------------------
 
 def _fact(kind: str, weight: float, personal: bool = False, **kw) -> tuple:
-    return kind, weight, random.choice(FACT_TEXTS[kind]).format(**kw), personal
+    return kind, weight, _esc(random.choice(FACT_TEXTS[kind])).format(**kw), personal
 
 
 def _aggregate_facts(r: dict, polls: list[dict]) -> list[tuple]:
@@ -234,7 +239,7 @@ def _personal_facts(r: dict, history: dict) -> list[tuple]:
         chain.insert(0, p["votes"])
 
     def names(uids):
-        return _join_names([people.get(uid, "без имени") for uid in uids])
+        return _names(uids, people)
 
     facts = []
 
@@ -349,7 +354,7 @@ def _verdict(r: dict, polls: list[dict], history: dict, shown: set[str]) -> str 
         tier = "heavier"
     else:
         tier = "normal"
-    return _rotate(tier, history).format(n=len(window), weeks=_weeks(len(window)), delta=abs(delta))
+    return _esc(_rotate(tier, history)).format(n=len(window), weeks=_weeks(len(window)), delta=abs(delta))
 
 
 def _rotate(tier: str, history: dict) -> str:
@@ -373,7 +378,7 @@ def _custom_lines(r: dict) -> list[str]:
     custom = r.get("custom_options", [])
     voted = [c for c in custom if c["votes"] > 0]
     if voted:
-        return ["", "✏️ Народное творчество:"] + [f'  • «{c["text"]}» — {c["votes"]} гол.' for c in voted]
+        return ["", "✏️ Народное творчество:"] + [f'  • «{_esc(c["text"])}» — {c["votes"]} гол.' for c in voted]
     if custom:
         return ["", "✏️ Народное творчество было, но никто не проголосовал."]
     return []
@@ -406,7 +411,7 @@ def _month_nominations(in_month: list[dict], prev: list[dict], people: dict) -> 
         return []
 
     def names(uids):
-        return _join_names([people.get(uid, "без имени") for uid in uids])
+        return _names(uids, people)
 
     per = _per_person(weeks)
     if not per:
@@ -517,7 +522,7 @@ def format_year_summary(record: dict, history: dict) -> str:
     customs = [(c["votes"], c["text"], p) for p in polls for c in p.get("custom_options", []) if c["votes"] > 0]
     if customs:
         votes, text, p = max(customs, key=lambda c: c[0])
-        lines.append(f"Лучшее народное творчество — «{text}» ({votes} гол., {_ddmm(p)})")
+        lines.append(f"Лучшее народное творчество — «{_esc(text)}» ({votes} гол., {_ddmm(p)})")
 
     return "\n".join(lines + _year_nominations(polls, history.get("people", {})))
 
@@ -530,7 +535,7 @@ def _year_nominations(polls: list[dict], people: dict) -> list[str]:
     need = -(-k // 2)  # хотя бы половина недель — чтобы не побеждали разовые голоса
 
     def names(uids):
-        return _join_names([people.get(uid, "без имени") for uid in uids])
+        return _names(uids, people)
 
     per = _per_person(weeks)
     if not per:
@@ -602,7 +607,7 @@ def _peak(scored: dict, people: dict) -> tuple[float, str] | None:
     holders = [(o, uid, d) for v, o, uid, d in votes if v == best]
     if best < 5 or len(holders) > 3:
         return None
-    who = _join_names([f"{people.get(uid, 'без имени')} ({_ddmm_iso(d)})" for _, uid, d in holders])
+    who = _join_names([f"{_mention(uid, people)} ({_ddmm_iso(d)})" for _, uid, d in holders])
     return best, f"{_label(holders[0][0])}: {who}"
 
 
@@ -685,7 +690,7 @@ def _label(idx: int) -> str:
     if idx == IDX_SOBER:
         return "0/10"
     if idx < IDX_STILL_DRUNK:
-        return POLL_OPTIONS[idx].split(" — ")[0]
+        return _esc(POLL_OPTIONS[idx].split(" — ")[0])
     if idx == IDX_STILL_DRUNK:
         return "«ещё пью»"
     if idx == IDX_PHANTOM:
@@ -706,9 +711,26 @@ def _num(v: float) -> str:
     return str(int(v)) if v == int(v) else str(v)
 
 
+def _names(uids: list[str], people: dict) -> str:
+    """Теги всех людей списком — без сокращения до «и ещё N»."""
+    return _join_names([_mention(uid, people) for uid in uids])
+
+
+def _mention(uid: str, people: dict) -> str:
+    """Тег человека: ссылка на профиль по id — уведомляет его, даже если нет username."""
+    return f'<a href="tg://user?id={uid}">{_esc(people.get(uid) or "без имени")}</a>'
+
+
+def _esc(text: str) -> str:
+    return html.escape(text, quote=False)
+
+
+def plain_text(text: str) -> str:
+    """Итоги так, как их видно в Telegram: без разметки тегов — для превью и тестов."""
+    return html.unescape(re.sub(r"</?a\b[^>]*>", "", text))
+
+
 def _join_names(names: list[str]) -> str:
-    if len(names) > 3:
-        return f"{', '.join(names[:3])} и ещё {len(names) - 3}"
     if len(names) > 1:
         return f"{', '.join(names[:-1])} и {names[-1]}"
     return names[0]

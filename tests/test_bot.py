@@ -288,6 +288,7 @@ def test_last_poll_of_year_sends_year_summary_separately():
     run(bot.close_poll(b))
     texts = [c["text"] for c in b.calls["send_message"]]
     assert len(texts) == 2 and texts[1].startswith("🎆 Итоги 2026 года")
+    assert all(c["parse_mode"] == "HTML" for c in b.calls["send_message"])  # теги людей — HTML-ссылками
 
 
 def test_failed_year_summary_does_not_repeat_close():

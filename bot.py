@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 
 import httpx
 from telegram import Bot, Poll
+from telegram.constants import ParseMode
 from telegram.error import Conflict, RetryAfter, TelegramError
 from telegram.request import HTTPXRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -448,6 +449,7 @@ async def close_poll(bot: Bot):
             await _call_api("sendMessage (итоги)", lambda: bot.send_message(
                 chat_id=CHANNEL_ID,
                 text=summary,
+                parse_mode=ParseMode.HTML,  # теги людей — ссылками tg://user?id=…
             ))
         except TelegramError as e:
             logger.error(
@@ -468,6 +470,7 @@ async def close_poll(bot: Bot):
                 await _call_api("sendMessage (итоги года)", lambda: bot.send_message(
                     chat_id=CHANNEL_ID,
                     text=year_summary,
+                    parse_mode=ParseMode.HTML,
                 ))
             except TelegramError as e:
                 logger.error("Итоги года не доставлены: %s", e)
